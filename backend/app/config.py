@@ -6,6 +6,9 @@ from pathlib import Path
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
+# 项目根目录（backend 的上一级）
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
 
 class Settings(BaseSettings):
     """应用配置"""
@@ -20,7 +23,7 @@ class Settings(BaseSettings):
     
     # 文件配置
     MAX_FILE_SIZE_MB: int = 10
-    TEMP_DIR: str = str(Path.home() / ".smartfill" / "temp")
+    TEMP_DIR: str = str(_PROJECT_ROOT / ".tempdocs")  # 默认: 项目根目录下的 .tempdocs
     ALLOWED_EXTENSIONS: set = {".pdf"}
     
     # AI 配置（预留）
@@ -28,7 +31,7 @@ class Settings(BaseSettings):
     QWEN_MODEL: str = "qwen-plus"
     
     # CORS 配置
-    CORS_ORIGINS: list = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    CORS_ORIGINS: str = ""  # 必须在 .env 中配置，多个地址用逗号分隔
     
     class Config:
         env_file = ".env"
@@ -39,18 +42,34 @@ class Settings(BaseSettings):
     def max_file_size_bytes(self) -> int:
         """获取最大文件大小（字节）"""
         return self.MAX_FILE_SIZE_MB * 1024 * 1024
+    
+    @property
+    def cors_origins_list(self) -> list:
+        """获取 CORS 源列表"""
+        if not self.CORS_ORIGINS:
+            return []
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
+
+
+# 模块级 Settings 实例
+settings = Settings()
 
 
 @lru_cache()
 def get_settings() -> Settings:
     """获取配置单例"""
-    return Settings()
+    return settings
 
 
 # 确保临时目录存在
 def ensure_temp_dir():
     """确保临时目录存在"""
-    settings = get_settings()
-    temp_path = Path(settings.TEMP_DIR)
+    s = get_settings()
+    temp_path = Path(s.TEMP_DIR)
+    
+    # 如果是相对路径，转换为绝对路径
+    if not temp_path.is_absolute():
+        temp_path = temp_path.resolve()
+    
     temp_path.mkdir(parents=True, exist_ok=True)
     return temp_path

@@ -74,10 +74,11 @@ export function FileUpload({
 
   // 点击上传区域
   const handleClick = useCallback(() => {
-    if (status !== 'uploading') {
+    // 只在空闲且无文件，或出错且无文件时，才允许打开文件选择
+    if ((status === 'idle' && !file) || (status === 'error' && !file)) {
       fileInputRef.current?.click();
     }
-  }, [status]);
+  }, [status, file]);
 
   // 渲染上传区域内容
   const renderContent = () => {
@@ -115,7 +116,7 @@ export function FileUpload({
             </p>
             <p className="text-neutral-500 text-sm mt-1">{file?.name}</p>
           </div>
-          <Button variant="ghost" size="sm" onClick={onReset}>
+          <Button variant="ghost" size="sm" onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReset(); }}>
             重新选择
           </Button>
         </div>
@@ -135,7 +136,7 @@ export function FileUpload({
             </p>
             <p className="text-neutral-500 text-sm mt-1">{error}</p>
           </div>
-          <Button variant="secondary" size="sm" onClick={onReset}>
+          <Button variant="secondary" size="sm" onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReset(); }}>
             重新选择
           </Button>
         </div>
@@ -158,10 +159,10 @@ export function FileUpload({
             </p>
           </div>
           <div className="flex gap-3">
-            <Button variant="secondary" size="sm" onClick={onReset}>
+            <Button variant="secondary" size="sm" onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReset(); }}>
               重新选择
             </Button>
-            <Button size="sm" onClick={onUpload}>
+            <Button size="sm" onClick={(e: React.MouseEvent) => { e.stopPropagation(); onUpload(); }}>
               开始上传
             </Button>
           </div>
@@ -219,7 +220,11 @@ export function FileUpload({
           border-2 border-dashed
           rounded-2xl
           transition-all duration-300 ease-out
-          cursor-pointer
+          ${
+            status === 'idle' || (status === 'error' && !file)
+              ? 'cursor-pointer'
+              : 'cursor-default'
+          }
           ${
             isDragOver
               ? 'border-primary-500 bg-gradient-to-br from-primary-50 to-primary-100 scale-[1.02] shadow-lift'
@@ -231,7 +236,7 @@ export function FileUpload({
               ? 'border-primary-300 bg-primary-50'
               : 'border-neutral-300 bg-white hover:border-primary-400 hover:bg-neutral-50'
           }
-          ${status === 'uploading' ? 'pointer-events-none' : ''}
+          ${status === 'uploading' || status === 'success' ? 'pointer-events-none' : ''}
         `}
       >
         {renderContent()}

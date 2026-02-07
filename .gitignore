@@ -1,0 +1,12 @@
+# 临时文件目录
+.tempdocs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

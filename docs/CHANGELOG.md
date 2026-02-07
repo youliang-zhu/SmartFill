@@ -631,4 +631,114 @@ body {
 
 ---
 
-## [Unreleased]
+## [v0.1.0-dev.2] - 2026-02-07 (PDF 字段读写)
+
+### 🎯 版本目标
+
+实现 PDF 表单字段的完整读写能力，打通"上传 → 提取字段 → 填写 → 下载"的后端核心链路。本版本聚焦**后端 PDF 处理逻辑**，前端仅做最小必要的接口对接。
+
+### 📋 任务拆解
+
+#### 1. 完善 `POST /extract-fields` 接口
+
+- 接收 `file_id`，从临时目录读取已上传的 PDF
+- 调用 `pdf_service.extract_form_fields()` 提取 AcroForm 字段
+- 返回字段名称列表 `{file_id, fields: string[], field_count: int, message}`
+- 错误处理：
+  - `file_id` 不存在 → 404 "文件不存在或已过期"
+  - PDF 无表单字段 → 400 "暂不支持扫描版PDF，请上传可编辑的PDF文件"（与 PRD 3.3 错误处理一致）
+  - PDF 解析异常 → 500 "无法识别表单字段，请确认这是一个标准表单"
+
+#### 2. 增强 `PDFService` 字段提取逻辑
+
+- 完善 `extract_form_fields()` 方法：
+  - 除字段名称外，同时提取字段类型（文本框、复选框、下拉框等）和已有默认值
+  - 返回结构化字段信息 `List[FieldInfo]`，包含 `name`, `type`, `default_value`
+  - 遍历所有页面的表单字段（当前实现仅用 `get_form_text_fields()`，可能遗漏非文本字段）
+- 新增 `has_form_fields()` 方法：快速判断 PDF 是否为可编辑表单
+- 新增 `get_field_details()` 方法：获取字段详细信息（用于调试和后续 AI 匹配）
+
+#### 3. 完善 `PDFService` 表单填写逻辑
+
+- 增强 `fill_form()` 方法：
+  - 支持多页表单字段填写（当前实现仅写入第一页）
+  - 填写后保留原有 PDF 格式和样式
+  - 返回更详细的结果（填写了哪些字段、跳过了哪些字段）
+- 输出文件命名规则：`原文件名_filled.pdf`（与 PRD F4 一致）
+
+#### 4. 实现 `POST /fill` 接口（简化版，不含 AI）
+
+- 本版本先实现**手动字段映射**的填写接口，不接入 AI
+- 请求体：`{file_id: string, field_values: Dict[str, str]}`（直接传入字段名→值的映射）
+- 流程：读取 PDF → 填写字段 → 生成新 PDF → 返回文件流
+- 响应：直接返回填好的 PDF 文件流（`application/pdf`），前端触发下载
+- 错误处理：
+  - `file_id` 不存在 → 404
+  - 填写失败 → 500 "填写失败，请检查输入信息或稍后重试"
+
+#### 5. 添加 Pydantic 模型
+
+- 新增 `FieldInfo` 模型：字段详细信息（名称、类型、默认值）
+- 扩展 `ExtractFieldsResponse`：增加 `field_count` 和结构化字段信息
+- 新增 `FillByFieldsRequest`：手动字段填写请求（区别于未来的 AI 填写）
+- 新增 `FillResponse`：填写结果响应（成功/失败、填写字段数等）
+
+#### 6. 错误处理与边界情况
+
+- PDF 文件损坏或无法解析
+- PDF 有密码保护（加密 PDF）
+- 表单字段为空（非可编辑 PDF）
+- 填写值类型不匹配（如给复选框传入长文本）
+- 输出文件写入失败（磁盘空间不足等）
+
+#### 7. 测试验证
+
+- 准备 2-3 个测试用 PDF 文件（放在 `backend/tests/fixtures/` 下）：
+  - 标准可编辑 PDF（带多种字段类型）
+  - 无表单字段的 PDF（纯文本/扫描版）
+  - 多页表单 PDF
+- 手动测试完整流程：上传 → 提取字段 → 填写 → 下载
+- 通过 FastAPI `/docs` 交互式文档逐个接口验证
+
+### ✅ 预期实现内容
+
+**后端**
+- 实现 `POST /api/v1/extract-fields` 字段提取接口
+- 实现 `POST /api/v1/fill` 表单填写接口（手动映射版）
+- 完善 `PDFService` 的字段提取和填写方法
+- 增加结构化字段信息模型 `FieldInfo`
+- 完善错误处理（文件不存在、非可编辑 PDF、加密 PDF 等）
+- 填写完成后清理临时文件
+
+**前端（最小改动）**
+- 在 `api.ts` 中新增 `extractFields()` 和 `fillPdf()` 接口封装
+- 前端类型定义补充 `FieldInfo` 等类型
+- 暂不做前端 UI 变更（字段展示和填写 UI 留到后续版本）
+
+### 📂 涉及文件
+
+**后端修改**
+- `backend/app/routers/pdf.py` - 新增 extract-fields 和 fill 路由
+- `backend/app/services/pdf_service.py` - 完善字段提取和填写逻辑
+- `backend/app/models/schemas.py` - 新增 FieldInfo 等数据模型
+- `backend/app/utils/validators.py` - 新增 file_id 存在性验证
+
+**后端新增**
+- `backend/tests/fixtures/` - 测试用 PDF 文件目录
+
+**前端修改**
+- `frontend/src/services/api.ts` - 新增接口调用函数
+- `frontend/src/types/index.ts` - 补充类型定义
+
+### ⚠️ 注意事项
+
+1. **本版本不接入 AI**：`/fill` 接口接收的是前端直接传入的 `{字段名: 值}` 映射，AI 语义匹配在 v0.1.0-dev.3 实现
+2. **pypdf 版本**：使用 `pypdf>=4.0.0`（非 PyPDF2），API 有差异，注意参考正确的文档
+3. **文件生命周期**：填写完成并返回文件流后，应清理原始临时文件和生成的临时文件
+4. **并发安全**：当前不考虑并发，同一文件不会被同时读写
+
+### 🔄 后续计划
+
+下一版本（v0.1.0-dev.3）将接入通义千问 AI 服务，实现用户自然语言输入 → AI 语义匹配字段 → 自动填写的完整智能链路。
+
+---
