@@ -1,5 +1,5 @@
 import axios, { AxiosError } from 'axios';
-import type { UploadResponse, ApiError } from '../types';
+import type { UploadResponse, ExtractFieldsResponse, ApiError } from '../types';
 
 // API 基础 URL
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1';
@@ -54,6 +54,37 @@ export async function uploadPdf(
  */
 export async function healthCheck(): Promise<{ status: string }> {
   const response = await apiClient.get('/health');
+  return response.data;
+}
+
+/**
+ * 提取 PDF 表单字段
+ * @param fileId 文件 ID（上传后返回）
+ * @returns 字段提取结果
+ */
+export async function extractFields(fileId: string): Promise<ExtractFieldsResponse> {
+  const response = await apiClient.post<ExtractFieldsResponse>('/extract-fields', {
+    file_id: fileId,
+  });
+  return response.data;
+}
+
+/**
+ * 填写 PDF 表单（手动字段映射版）
+ * @param fileId 文件 ID
+ * @param fieldValues 字段名到值的映射
+ * @returns 填好的 PDF 文件 Blob
+ */
+export async function fillPdf(
+  fileId: string,
+  fieldValues: Record<string, string>
+): Promise<Blob> {
+  const response = await apiClient.post('/fill', {
+    file_id: fileId,
+    field_values: fieldValues,
+  }, {
+    responseType: 'blob',
+  });
   return response.data;
 }
 

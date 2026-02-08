@@ -5,15 +5,25 @@ export interface UploadResponse {
   message: string;
 }
 
-export interface ExtractFieldsResponse {
-  fields: string[];
-  file_id: string;
+// 表单字段详细信息
+export interface FieldInfo {
+  name: string;
+  field_type: string; // text, checkbox, dropdown, radio, signature
+  default_value: string | null;
 }
 
-export interface FillResponse {
-  // 返回 PDF 文件流，前端处理为 Blob
-  success: boolean;
-  message?: string;
+export interface ExtractFieldsResponse {
+  file_id: string;
+  fields: string[];
+  field_details: FieldInfo[];
+  field_count: number;
+  message: string;
+}
+
+// 手动字段映射填写请求
+export interface FillByFieldsRequest {
+  file_id: string;
+  field_values: Record<string, string>;
 }
 
 export interface HealthResponse {
@@ -29,7 +39,7 @@ export interface ApiError {
 export type UploadStatus = 'idle' | 'uploading' | 'success' | 'error';
 
 // 文件信息
-export interface FileInfo {
+export interface PdfFileInfo {
   file: File;
   name: string;
   size: number;
