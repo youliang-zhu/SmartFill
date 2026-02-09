@@ -74,11 +74,25 @@ export function FileUpload({
 
   // 点击上传区域
   const handleClick = useCallback(() => {
-    // 只在空闲且无文件，或出错且无文件时，才允许打开文件选择
+    // 空闲且无文件，或出错且无文件时，点击区域打开文件选择
     if ((status === 'idle' && !file) || (status === 'error' && !file)) {
       fileInputRef.current?.click();
     }
   }, [status, file]);
+
+  // 重新选择文件（先重置状态，再弹出文件选择）
+  const handleReselect = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    // 清空 input 的 value，这样即使选择同一个文件也会触发 onChange
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+    onReset();
+    // 用 setTimeout 确保状态重置后再弹出文件选择
+    setTimeout(() => {
+      fileInputRef.current?.click();
+    }, 100);
+  }, [onReset]);
 
   // 渲染上传区域内容
   const renderContent = () => {
@@ -116,7 +130,7 @@ export function FileUpload({
             </p>
             <p className="text-neutral-500 text-sm mt-1">{file?.name}</p>
           </div>
-          <Button variant="ghost" size="sm" onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReset(); }}>
+          <Button variant="ghost" size="sm" onClick={handleReselect}>
             重新选择
           </Button>
         </div>
@@ -136,7 +150,7 @@ export function FileUpload({
             </p>
             <p className="text-neutral-500 text-sm mt-1">{error}</p>
           </div>
-          <Button variant="secondary" size="sm" onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReset(); }}>
+          <Button variant="secondary" size="sm" onClick={handleReselect}>
             重新选择
           </Button>
         </div>
@@ -159,7 +173,7 @@ export function FileUpload({
             </p>
           </div>
           <div className="flex gap-3">
-            <Button variant="secondary" size="sm" onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReset(); }}>
+            <Button variant="secondary" size="sm" onClick={handleReselect}>
               重新选择
             </Button>
             <Button size="sm" onClick={(e: React.MouseEvent) => { e.stopPropagation(); onUpload(); }}>
@@ -236,7 +250,7 @@ export function FileUpload({
               ? 'border-primary-300 bg-primary-50'
               : 'border-neutral-300 bg-white hover:border-primary-400 hover:bg-neutral-50'
           }
-          ${status === 'uploading' || status === 'success' ? 'pointer-events-none' : ''}
+          ${status === 'uploading' ? 'pointer-events-none' : ''}
         `}
       >
         {renderContent()}

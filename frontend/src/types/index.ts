@@ -26,6 +26,12 @@ export interface FillByFieldsRequest {
   field_values: Record<string, string>;
 }
 
+// AI 智能填写请求
+export interface FillRequest {
+  file_id: string;
+  user_info: string;
+}
+
 export interface HealthResponse {
   status: string;
 }

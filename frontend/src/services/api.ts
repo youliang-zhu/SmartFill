@@ -70,18 +70,37 @@ export async function extractFields(fileId: string): Promise<ExtractFieldsRespon
 }
 
 /**
- * 填写 PDF 表单（手动字段映射版）
+ * 填写 PDF 表单（手动字段映射版，用于调试）
  * @param fileId 文件 ID
  * @param fieldValues 字段名到值的映射
  * @returns 填好的 PDF 文件 Blob
  */
-export async function fillPdf(
+export async function fillPdfByFields(
   fileId: string,
   fieldValues: Record<string, string>
 ): Promise<Blob> {
-  const response = await apiClient.post('/fill', {
+  const response = await apiClient.post('/fill-by-fields', {
     file_id: fileId,
     field_values: fieldValues,
+  }, {
+    responseType: 'blob',
+  });
+  return response.data;
+}
+
+/**
+ * AI 智能填写 PDF 表单
+ * @param fileId 文件 ID
+ * @param userInfo 用户自然语言输入的信息
+ * @returns 填好的 PDF 文件 Blob
+ */
+export async function fillPdfWithAI(
+  fileId: string,
+  userInfo: string
+): Promise<Blob> {
+  const response = await apiClient.post('/fill', {
+    file_id: fileId,
+    user_info: userInfo,
   }, {
     responseType: 'blob',
   });

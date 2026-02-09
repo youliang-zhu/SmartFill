@@ -737,8 +737,119 @@ body {
 3. **文件生命周期**：填写完成并返回文件流后，应清理原始临时文件和生成的临时文件
 4. **并发安全**：当前不考虑并发，同一文件不会被同时读写
 
-### 🔄 后续计划
-
-下一版本（v0.1.0-dev.3）将接入通义千问 AI 服务，实现用户自然语言输入 → AI 语义匹配字段 → 自动填写的完整智能链路。
-
 ---
+
+## [v0.1.0-dev.3] - 2026-02-09 (AI 智能填写)
+
+### 🎯 版本目标
+
+接入通义千问（Qwen）大模型，实现 **用户自然语言输入 → AI 语义匹配表单字段 → 自动填写 PDF** 的核心智能链路。本版本完成后，产品的 MVP 核心流程将全部打通。
+
+### 🔑 API 配置（临时，上线前删除）
+
+通义千问使用 OpenAI 兼容模式调用：
+
+```
+API_KEY: sk-dcff60c19e3245e387fdfa95958dfd2e
+BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL: qwen-turbo
+```
+
+**环境变量配置**（写入 `backend/.env`）：
+```
+QWEN_API_KEY=sk-dcff60c19e3245e387fdfa95958dfd2e
+QWEN_MODEL=qwen-turbo
+QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+### 📋 任务拆解
+
+#### 1. 新增依赖
+
+- `requirements.txt` 中启用 `openai>=1.10.0`（使用 OpenAI 兼容模式调用通义千问）
+- `config.py` 新增 `QWEN_BASE_URL` 环境变量
+
+#### 2. 实现 `QwenService`
+
+完善 `ai_service.py` 中已预留的 `QwenService` 类：
+
+- 使用 `openai` SDK 的 `client.chat.completions.create()` 调用
+- 核心方法 `match_fields(fields, user_info) → Dict[str, str]`：
+  - 输入：PDF 表单字段名列表 + 用户的自然语言信息
+  - 输出：`{字段名: 填写值}` 的映射
+  - AI 返回 JSON 格式，代码解析后直接传给 `pdf_service.fill_form()`
+- Prompt 设计要点：
+  - 明确告知 AI 可用的字段名列表
+  - 要求 AI 严格输出 JSON，key 必须是字段列表中的名称
+  - 对于无法匹配的字段，值留空字符串
+  - 支持中英文混合的字段名和用户输入
+- 错误处理：API 调用超时、返回格式异常、JSON 解析失败
+
+#### 3. 实现 `POST /api/v1/fill`（AI 版）
+
+修改现有 `/fill` 路由，使用 `FillRequest`（`{file_id, user_info}`）：
+
+- 流程：提取字段 → AI 匹配 → 填写 PDF → 返回文件流
+- 保留 `/fill-by-fields` 手动映射接口（重命名现有 `/fill`），用于调试
+- 错误处理：
+  - AI 调用失败 → 500 "AI 服务暂时不可用，请稍后重试"
+  - AI 返回格式异常 → 500 "填写失败，请检查输入信息或稍后重试"
+  - 超时（>30秒）→ 500 "处理超时，请稍后重试"
+
+#### 4. Prompt 工程
+
+```
+你是一个 PDF 表单填写助手。
+
+任务：将用户提供的信息匹配到 PDF 表单的字段中。
+
+PDF 表单字段列表：
+{fields_json}
+
+用户提供的信息：
+{user_info}
+
+要求：
+1. 将用户信息准确匹配到对应的字段
+2. 只使用上面列出的字段名作为 key
+3. 无法匹配的字段，值设为空字符串 ""
+4. 直接输出 JSON，不要包含其他文字
+5. 所有值都是字符串类型
+
+输出格式示例：
+{"姓名": "张三", "电话": "13800138000", "地址": ""}
+```
+
+#### 5. 前端对接
+
+- `api.ts` 新增 `fillPdfWithAI(file_id, user_info)` 接口
+- 前端类型无需大改，`FillRequest` 已预留
+
+### ✅ 预期实现内容
+
+**后端**
+- 实现 `QwenService.match_fields()` AI 字段匹配
+- 实现 `POST /api/v1/fill` AI 智能填写接口
+- 现有手动填写接口改为 `POST /api/v1/fill-by-fields`
+- `config.py` 新增 `QWEN_BASE_URL` 配置
+- `requirements.txt` 启用 `openai` 依赖
+
+**前端**
+- `api.ts` 新增 AI 填写接口调用
+
+### 📂 涉及文件
+
+**后端修改**
+- `backend/app/services/ai_service.py` - 实现 QwenService
+- `backend/app/routers/pdf.py` - 新增 AI fill 路由，重命名旧路由
+- `backend/app/config.py` - 新增 QWEN_BASE_URL，修复已知格式问题
+- `backend/requirements.txt` - 启用 openai 依赖
+- `backend/.env.example` - 补充 AI 相关环境变量说明
+
+**前端修改**
+- `frontend/src/services/api.ts` - 新增 AI 填写接口
+
+### ⚠️ 注意事项
+
+1. **使用 OpenAI 兼容模式**：不用 `dashscope` SDK，统一用 `openai` SDK + 自定义 `base_url`，未来切换 OpenAI/Claude 更方便
+2. **Prompt 需要迭代**：第一版 Prompt 先跑通，后续根据测试结果调优
