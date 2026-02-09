@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings, ensure_temp_dir
+from app.logging_config import setup_logging
 from app.routers import pdf
 
 # 获取配置
@@ -35,6 +36,8 @@ app.include_router(pdf.router, prefix=settings.API_V1_PREFIX)
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件"""
+    # 初始化日志系统
+    setup_logging()
     # 确保临时目录存在
     ensure_temp_dir()
     print(f"🚀 {settings.APP_NAME} v{settings.APP_VERSION} started")

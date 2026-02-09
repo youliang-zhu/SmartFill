@@ -1,12 +1,16 @@
 """
 PDF 处理服务 - 表单字段读写
 """
+import logging
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import BooleanObject, NameObject, TextStringObject
 
 from app.models.schemas import FieldInfo, FillResult
+
+logger = logging.getLogger("app.services.ai_service")  # 复用 AI 日志文件
 
 
 # pypdf 字段类型常量映射
@@ -166,8 +170,7 @@ class PDFService:
         if reader.is_encrypted:
             raise PermissionError("PDF 文件被密码保护，无法读取")
         
-        writer = PdfWriter()
-        writer.append_pages_from_reader(reader)
+        writer = PdfWriter(clone_from=str(pdf_path))
         
         # 获取 PDF 中实际存在的字段名
         existing_fields = set()
@@ -188,17 +191,63 @@ class PDFService:
         # 只填写 PDF 中实际存在的字段
         values_to_fill = {k: v for k, v in field_values.items() if k in existing_fields}
         
+        logger.info(f"[PDF 填写] 准备写入 {len(values_to_fill)} 个字段: {values_to_fill}")
+        logger.info(f"[PDF 填写] 总页数: {len(writer.pages)}")
+        
+        actually_filled: List[str] = []
+        
         if values_to_fill:
-            # 遍历所有页面，填写表单字段
+            # 手动遍历所有页面的 annotations，直接写入字段值
             for page_num in range(len(writer.pages)):
-                try:
-                    writer.update_page_form_field_values(
-                        writer.pages[page_num],
-                        values_to_fill
-                    )
-                except Exception:
-                    # 某些页面可能没有表单字段，跳过
+                page = writer.pages[page_num]
+                annots = page.get("/Annots")
+                if not annots:
+                    logger.info(f"[PDF 填写] 第 {page_num + 1} 页: 无 annotations，跳过")
                     continue
+                
+                logger.info(f"[PDF 填写] 第 {page_num + 1} 页: {len(annots)} 个 annotations")
+                
+                for annot in annots:
+                    # 兼容 IndirectObject 和 dict
+                    annot_obj = annot.get_object() if hasattr(annot, 'get_object') else annot
+                    
+                    field_name = annot_obj.get("/T")
+                    if field_name is None:
+                        continue
+                    
+                    field_name_str = str(field_name)
+                    
+                    if field_name_str in values_to_fill:
+                        value = values_to_fill[field_name_str]
+                        # 直接设置 /V（字段值）
+                        annot_obj[NameObject("/V")] = TextStringObject(value)
+                        # 同时设置 /AP 为空，强制 PDF 阅读器重新渲染显示
+                        if NameObject("/AP") in annot_obj:
+                            del annot_obj[NameObject("/AP")]
+                        actually_filled.append(field_name_str)
+                        logger.info(f"  ✅ {field_name_str} = {value}")
+                    else:
+                        logger.info(f"  ⏭️ {field_name_str}: 无匹配值，跳过")
+        
+        # 设置 NeedAppearances 标志，确保 PDF 阅读器重新生成字段外观
+        try:
+            root = writer._root_object if hasattr(writer, '_root_object') else None
+            if root is None and hasattr(writer, '_root'):
+                root = writer._root
+            if root:
+                acroform = root.get("/AcroForm")
+                if acroform:
+                    acro_obj = acroform.get_object() if hasattr(acroform, 'get_object') else acroform
+                    acro_obj[NameObject("/NeedAppearances")] = BooleanObject(True)
+                    logger.info("[PDF 填写] 已设置 /NeedAppearances = true")
+                else:
+                    logger.warning("[PDF 填写] 未找到 /AcroForm，跳过 NeedAppearances 设置")
+            else:
+                logger.warning("[PDF 填写] 无法访问 root object，跳过 NeedAppearances 设置")
+        except Exception as e:
+            logger.warning(f"[PDF 填写] 设置 NeedAppearances 失败（不影响填写）: {e}")
+        
+        logger.info(f"[PDF 填写] 实际写入成功: {len(actually_filled)} 个字段: {actually_filled}")
         
         # 保存输出文件
         try:

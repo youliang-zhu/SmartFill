@@ -6,9 +6,8 @@ python-multipart>=0.0.6
 # PDF Processing
 pypdf>=4.0.0
 
-# AI Service (预留，v0.1.0-dev.1 不使用)
-# openai>=1.10.0
-# dashscope>=1.14.0
+# AI Service（通义千问 - OpenAI 兼容模式）
+openai>=1.10.0
 
 # Utilities
 pydantic>=2.5.0

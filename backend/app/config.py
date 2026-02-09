@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     
     # 应用信息
     APP_NAME: str = "SmartFill"
-    APP_VERSION: str = "0.1.0-dev.1"
+    APP_VERSION: str = "0.1.0-dev.3"
     DEBUG: bool = False
     
     # API 配置
@@ -26,9 +26,10 @@ class Settings(BaseSettings):
     TEMP_DIR: str = str(_PROJECT_ROOT / ".tempdocs")  # 默认: 项目根目录下的 .tempdocs
     ALLOWED_EXTENSIONS: set = {".pdf"}
     
-    # AI 配置（预留）
+    # AI 配置（通义千问 - OpenAI 兼容模式）
     QWEN_API_KEY: str = ""
-    QWEN_MODEL: str = "qwen-plus"
+    QWEN_MODEL: str = "qwen-turbo"
+    QWEN_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     
     # CORS 配置
     CORS_ORIGINS: str = ""  # 必须在 .env 中配置，多个地址用逗号分隔

@@ -11,6 +11,7 @@ from app.models.schemas import (
     HealthResponse,
     ExtractFieldsRequest,
     ExtractFieldsResponse,
+    FillRequest,
     FillByFieldsRequest,
 )
 from app.utils.file_handler import get_storage
@@ -21,6 +22,7 @@ from app.utils.validators import (
     validate_file_exists,
 )
 from app.services.pdf_service import get_pdf_service
+from app.services.ai_service import get_ai_service
 
 router = APIRouter(tags=["PDF"])
 
@@ -148,11 +150,122 @@ async def extract_fields(request: ExtractFieldsRequest):
 
 
 @router.post("/fill")
-async def fill_pdf(request: FillByFieldsRequest):
+async def fill_pdf_with_ai(request: FillRequest):
     """
-    填写 PDF 表单（手动字段映射版）
+    AI 智能填写 PDF 表单
     
-    根据传入的字段名→值映射，填写 PDF 表单并返回填好的文件。
+    接收用户自然语言输入，通过 AI 语义匹配表单字段并自动填写。
+    
+    - **file_id**: 之前上传返回的文件唯一标识
+    - **user_info**: 用户自然语言输入的信息（如"我叫张三，电话13800138000"）
+    
+    返回:
+    - 填好的 PDF 文件流（application/pdf）
+    """
+    # 验证文件是否存在
+    pdf_path = validate_file_exists(request.file_id)
+    
+    storage = get_storage()
+    pdf_service = get_pdf_service()
+    
+    # 1. 提取 PDF 表单字段
+    try:
+        has_fields = pdf_service.has_form_fields(pdf_path)
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="PDF 文件被密码保护，无法读取"
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="无法识别表单字段，请确认这是一个标准表单"
+        )
+    
+    if not has_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="暂不支持扫描版PDF，请上传可编辑的PDF文件"
+        )
+    
+    try:
+        field_names = pdf_service.extract_form_fields(pdf_path)
+    except (PermissionError, ValueError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"无法识别表单字段，请确认这是一个标准表单: {str(e)}"
+        )
+    
+    # 2. AI 语义匹配
+    try:
+        ai_service = get_ai_service()
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    
+    try:
+        field_values = await ai_service.match_fields(field_names, request.user_info)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="处理超时，请稍后重试"
+        )
+    except ConnectionError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AI 服务暂时不可用，请稍后重试"
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="填写失败，请检查输入信息或稍后重试"
+        )
+    
+    # 3. 填写 PDF
+    original_filename = storage.get_filename(request.file_id) or "document.pdf"
+    stem = Path(original_filename).stem
+    output_filename = f"{stem}_filled.pdf"
+    output_path = pdf_path.parent / output_filename
+    
+    try:
+        result = pdf_service.fill_form(pdf_path, field_values, output_path)
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="PDF 文件被密码保护，无法填写"
+        )
+    except (ValueError, IOError):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="填写失败，请检查输入信息或稍后重试"
+        )
+    
+    # 检查输出文件是否生成
+    if not output_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="填写失败，请检查输入信息或稍后重试"
+        )
+    
+    return FileResponse(
+        path=str(output_path),
+        media_type="application/pdf",
+        filename=output_filename,
+        headers={
+            "Content-Disposition": f'attachment; filename="{output_filename}"'
+        }
+    )
+
+
+@router.post("/fill-by-fields")
+async def fill_pdf_by_fields(request: FillByFieldsRequest):
+    """
+    填写 PDF 表单（手动字段映射版，用于调试）
+    
+    直接传入字段名→值映射，填写 PDF 表单并返回填好的文件。
+    此接口不经过 AI，主要用于调试和精确控制填写内容。
     
     - **file_id**: 之前上传返回的文件唯一标识
     - **field_values**: 字段名称到值的映射，如 {"姓名": "张三", "电话": "13800138000"}
@@ -192,11 +305,6 @@ async def fill_pdf(request: FillByFieldsRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"填写失败，请检查输入信息或稍后重试: {str(e)}"
         )
-    
-    # 记录填写结果（用于调试）
-    print(f"📝 填写完成: 成功 {result.total_filled} 个字段, 跳过 {result.total_skipped} 个字段")
-    if result.skipped_fields:
-        print(f"   跳过的字段: {result.skipped_fields}")
     
     # 检查输出文件是否生成
     if not output_path.exists():
