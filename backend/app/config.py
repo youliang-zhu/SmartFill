@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     
     # 应用信息
     APP_NAME: str = "SmartFill"
-    APP_VERSION: str = "0.1.0-dev.3"
+    APP_VERSION: str = "0.1.0-dev.4"
     DEBUG: bool = False
     
     # API 配置

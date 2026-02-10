@@ -853,3 +853,211 @@ PDF 表单字段列表：
 
 1. **使用 OpenAI 兼容模式**：不用 `dashscope` SDK，统一用 `openai` SDK + 自定义 `base_url`，未来切换 OpenAI/Claude 更方便
 2. **Prompt 需要迭代**：第一版 Prompt 先跑通，后续根据测试结果调优
+
+---
+
+## [v0.1.0-dev.4] - 2026-02-10 (前端完整流程 & MVP 定版)
+
+### 🎯 版本目标
+
+将前端 3 步流程（上传 → 输入信息 → AI 填写 & 下载）完整串联，实现 PRD 3.2 定义的完整用户闭环。本版本完成后，SmartFill MVP 核心功能全部就绪，产品可交付种子用户试用。
+
+**核心产出**：用户可以在一个页面内，完成 "上传 PDF → 自然语言输入信息 → AI 自动填写 → 下载填好的 PDF" 全流程。
+
+### 📋 任务拆解
+
+#### 1. 新增 `useSmartFill` Hook — 全流程状态管理
+
+新增 `frontend/src/hooks/useSmartFill.ts`，作为 3 步流程的核心状态机：
+
+```typescript
+// 全流程步骤
+type FlowStep = 'upload' | 'input' | 'filling' | 'download';
+
+interface UseSmartFillReturn {
+  // 当前步骤
+  currentStep: FlowStep;
+
+  // Step 1: 上传相关（复用 useFileUpload）
+  fileUpload: ReturnType<typeof useFileUpload>;
+
+  // Step 2: 信息输入
+  userInfo: string;
+  setUserInfo: (value: string) => void;
+
+  // Step 3: AI 填写 & 下载
+  filledPdfBlob: Blob | null;
+  filledFileName: string;
+  fillError: string | null;
+  isFilling: boolean;
+
+  // 操作
+  handleStartFill: () => Promise<void>;  // 触发 AI 填写
+  handleDownload: () => void;            // 触发下载
+  handleReset: () => void;               // 重置全部，回到第 1 步
+}
+```
+
+**状态流转逻辑**：
+
+```
+upload(idle) → upload(uploading) → upload(success) → input → filling → download
+                    ↓                                           ↓
+               upload(error)                              fillError → input
+                                                                     (允许修改信息重试)
+
+任意状态 → handleReset() → upload(idle)
+```
+
+**关键设计决策**：
+- `currentStep` 根据子状态自动推导：
+  - `upload`: 当 `fileUpload.status` 为 `idle | uploading | error` 时
+  - `input`: 当上传成功且用户未点击"开始填写"时
+  - `filling`: 当 AI 正在处理时（显示 LoadingOverlay）
+  - `download`: 当 `filledPdfBlob` 非空时
+- 不需要手动切换步骤，状态完全由数据驱动
+- `handleStartFill()` 内部调用 `fillPdfWithAI(fileId, userInfo)`，拿到 Blob 后存入 state
+- `handleDownload()` 用 `URL.createObjectURL` 创建下载链接，文件名使用 `原文件名_filled.pdf`
+- `handleReset()` 清空所有 state，调用 `fileUpload.reset()`
+
+#### 2. 重构 `App.tsx` — 3 步流程 UI
+
+**整体结构**：
+
+```
+Header (不变)
+  ↓
+Hero Section (随步骤变化 subtitle)
+  ↓
+Steps Indicator (步骤指示器，高亮当前步骤，已完成步骤打勾)
+  ↓
+Main Content Area (根据 currentStep 渲染不同组件)
+  ├── upload  → <FileUpload />
+  ├── input   → 上传成功摘要 + <InfoInput /> + "开始填写"按钮
+  ├── filling → <LoadingOverlay /> (覆盖全屏)
+  └── download → 成功提示 + <DownloadButton /> + "重新开始"按钮
+  ↓
+Footer (不变)
+```
+
+**各步骤 UI 细节**：
+
+**Step 1 - 上传文件** (`currentStep === 'upload'`)：
+- 渲染 `<FileUpload />` 组件（与当前行为一致）
+- 上传成功后，`currentStep` 自动切换到 `input`
+
+**Step 2 - 输入信息** (`currentStep === 'input'`)：
+- 顶部显示上传成功摘要卡片（文件名、文件大小、勾选图标）
+- 渲染 `<InfoInput />` 组件
+- 底部渲染"开始填写"按钮（`<Button>` primary，disabled 当 `userInfo` 为空）
+- 底部二级按钮："重新选择文件"（触发 `handleReset()`）
+- 输入验证：`userInfo.trim().length > 0` 才允许提交
+
+**Step 3a - AI 填写中** (`currentStep === 'filling'`)：
+- 渲染 `<LoadingOverlay isVisible={true} text="AI 正在填写表单..." />`
+- 覆盖全屏，用户无法操作
+- 填写失败 → 回到 `input` 步骤，显示错误提示，用户可修改信息后重试
+
+**Step 3b - 下载结果** (`currentStep === 'download'`)：
+- 顶部成功提示区域（绿色背景，勾选图标 + "填写完成！"）
+- 渲染 `<DownloadButton isReady={true} fileName={filledFileName} />`
+- 底部"重新开始"按钮（触发 `handleReset()`）
+
+**Hero subtitle 随步骤变化**：
+- `upload`: "上传表单，输入信息，AI 自动完成填写"
+- `input`: "请输入需要填写的信息"
+- `filling`: "AI 正在处理您的表单..."
+- `download`: "表单填写完成，请下载查看"
+
+#### 3. 改进 Steps Indicator — 动态步骤指示器
+
+将 `App.tsx` 中静态的步骤指示器改为动态组件：
+
+- 当前步骤：高亮（primary 色）
+- 已完成步骤：绿色勾选 ✓
+- 未到达步骤：灰色
+- 步骤映射：
+  - Step 1 "上传文件": active 当 `currentStep === 'upload'`，completed 当 `currentStep !== 'upload'`
+  - Step 2 "输入信息": active 当 `currentStep === 'input' | 'filling'`，completed 当 `currentStep === 'download'`
+  - Step 3 "下载结果": active 当 `currentStep === 'download'`
+
+步骤指示器放在 Hero Section 下方、Main Content Area 上方，始终可见。
+
+#### 4. 文件下载实现
+
+在 `useSmartFill` 的 `handleDownload()` 中：
+
+```typescript
+const handleDownload = () => {
+  if (!filledPdfBlob) return;
+  const url = URL.createObjectURL(filledPdfBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filledFileName; // e.g. "合同_filled.pdf"
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+```
+
+文件名生成规则：`generateFileName(originalFileName)` 已在 `helpers.ts` 中实现，格式为 `原文件名_filled.pdf`。
+
+#### 5. 错误处理 (对应 PRD 3.3)
+
+| 场景 | 处理方式 | 用户感知 |
+|------|---------|---------|
+| 上传阶段 - 非 PDF | `FileUpload` 组件已处理 | "仅支持 PDF 格式" |
+| 上传阶段 - 超 10MB | `FileUpload` 组件已处理 | "文件大小不能超过 10MB" |
+| 上传阶段 - 非可编辑 PDF | 后端 400 返回 | "暂不支持扫描版 PDF，请上传可编辑的 PDF 文件" |
+| 填写阶段 - AI 调用失败 | 回到 input 步骤 + 显示 error | "AI 服务暂时不可用，请稍后重试" |
+| 填写阶段 - 超时 (>60s) | 回到 input 步骤 + 显示 error | "处理超时，请稍后重试" |
+| 填写阶段 - 格式异常 | 回到 input 步骤 + 显示 error | "填写失败，请检查输入信息或稍后重试" |
+| 下载阶段 - Blob 创建失败 | try-catch + alert | "下载失败，请重试" |
+
+错误消息统一从后端响应的 `detail` 字段提取（已在 `api.ts` 拦截器中处理）。
+
+#### 6. 移动端适配
+
+- 所有组件已使用 Tailwind 响应式类，本版本无需新增断点逻辑
+- 关键确认项：
+  - `InfoInput` 的 `<Textarea>` 在移动端有足够高度（最少 4 行）
+  - "开始填写"按钮为 `w-full`
+  - `LoadingOverlay` 在移动端正确居中
+  - 步骤指示器在小屏下不换行（已用 `grid-cols-3` 保证）
+
+### ✅ 预期实现内容
+
+**前端新增**
+- `frontend/src/hooks/useSmartFill.ts` - 全流程状态机 Hook
+- 步骤指示器改为动态高亮 + 已完成勾选
+
+**前端修改**
+- `frontend/src/App.tsx` - 重构为 3 步流程（主要改动文件）
+- `frontend/src/components/features/DownloadButton.tsx` - 微调（如需）
+- `frontend/src/App.tsx` 版本号更新为 `v0.1.0-dev.4`
+
+**后端修改**
+- `backend/app/config.py` - 版本号更新为 `0.1.0-dev.4`
+
+**无需新增后端 API** — 所有接口（`/upload`、`/extract-fields`、`/fill`）已在 v1-v3 完成。
+
+### 📂 涉及文件
+
+**新增文件**
+- `frontend/src/hooks/useSmartFill.ts` - 全流程状态管理 Hook
+
+**前端修改**
+- `frontend/src/App.tsx` - 重构为完整 3 步流程（核心改动）
+- `frontend/src/components/features/DownloadButton.tsx` - 接入实际下载逻辑（如需微调 props）
+
+**后端修改**
+- `backend/app/config.py` - 版本号
+
+### ⚠️ 注意事项
+
+1. **不新增组件**：`InfoInput`、`DownloadButton`、`LoadingOverlay` 已在前序版本创建完毕，本版本只需导入和组装
+2. **不新增 API**：`fillPdfWithAI()` 已在 v3 的 `api.ts` 中实现，本版本只需在 Hook 中调用
+3. **状态由数据驱动**：`currentStep` 不需要 `setState` 手动切换，而是由 `fileUpload.status`、`filledPdfBlob`、`isFilling` 等底层状态推导
+4. **`/extract-fields` 不直接调用**：AI 填写接口 `/fill` 内部已包含字段提取逻辑，前端无需单独调用 `extractFields()`
+5. **PRD 3.2 步骤 7 偏差**：PRD 写"自动下载"，但与用户确认后改为"用户点击下载"，符合更好的 UX 实践
