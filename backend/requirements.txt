@@ -5,6 +5,7 @@ python-multipart>=0.0.6
 
 # PDF Processing
 pypdf>=4.0.0
+pymupdf>=1.24.0
 
 # AI Service（通义千问 - OpenAI 兼容模式）
 openai>=1.10.0

@@ -25,7 +25,7 @@ def setup_logging():
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     
     # AI 服务专用 logger
-    ai_logger = logging.getLogger("app.services.ai_service")
+    ai_logger = logging.getLogger("app.services.fillable.ai_service")
     ai_logger.setLevel(logging.DEBUG)
     
     # 避免重复添加 handler（热重载场景）

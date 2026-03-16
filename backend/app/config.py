@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     QWEN_API_KEY: str = ""
     QWEN_MODEL: str = "qwen-turbo"
     QWEN_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    # VLM 配置（v2 预留；保持向后兼容）
+    VLM_PROVIDER: str = "qwen-vl"
+    VLM_API_KEY: str = ""
+    VLM_MODEL: str = ""
+    VLM_BASE_URL: str = ""
+    VLM_MAX_IMAGE_WIDTH: int = 1536
     
     # CORS 配置
     CORS_ORIGINS: str = ""  # 必须在 .env 中配置，多个地址用逗号分隔
@@ -50,6 +57,21 @@ class Settings(BaseSettings):
         if not self.CORS_ORIGINS:
             return []
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
+
+    @property
+    def resolved_vlm_api_key(self) -> str:
+        """VLM API Key（优先 VLM_*，回退 QWEN_*）"""
+        return self.VLM_API_KEY or self.QWEN_API_KEY
+
+    @property
+    def resolved_vlm_model(self) -> str:
+        """VLM 模型名（优先 VLM_*，回退 QWEN_*）"""
+        return self.VLM_MODEL or self.QWEN_MODEL
+
+    @property
+    def resolved_vlm_base_url(self) -> str:
+        """VLM Base URL（优先 VLM_*，回退 QWEN_*）"""
+        return self.VLM_BASE_URL or self.QWEN_BASE_URL
 
 
 # 模块级 Settings 实例

@@ -21,8 +21,8 @@ from app.utils.validators import (
     validate_pdf_header,
     validate_file_exists,
 )
-from app.services.pdf_service import get_pdf_service
-from app.services.ai_service import get_ai_service
+from app.services.pdf_classifier import get_pdf_classifier
+from app.services.pdf_pipeline_dispatcher import get_pdf_pipeline_dispatcher
 
 router = APIRouter(tags=["PDF"])
 
@@ -78,6 +78,37 @@ async def upload_pdf(file: UploadFile = File(...)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"保存文件失败: {str(e)}"
         )
+
+    # 上传阶段类型校验：当前仅允许 fillable(AcroForm)
+    pdf_path = storage.get_path(file_id)
+    if pdf_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="保存文件后无法读取，请稍后重试"
+        )
+
+    classifier = get_pdf_classifier()
+    try:
+        pdf_type = classifier.classify(pdf_path)
+    except PermissionError:
+        storage.delete(file_id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="PDF 文件被密码保护，无法读取"
+        )
+    except ValueError:
+        storage.delete(file_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="无法识别 PDF 类型，请确认这是一个标准 PDF"
+        )
+
+    if pdf_type != "fillable":
+        storage.delete(file_id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"暂不支持 {pdf_type} 类型 PDF，请上传 AcroForm 可编辑 PDF"
+        )
     
     return UploadResponse(
         file_id=file_id,
@@ -102,42 +133,25 @@ async def extract_fields(request: ExtractFieldsRequest):
     """
     # 验证文件是否存在
     pdf_path = validate_file_exists(request.file_id)
-    
-    pdf_service = get_pdf_service()
-    
-    # 检查是否为可编辑 PDF
-    try:
-        has_fields = pdf_service.has_form_fields(pdf_path)
-    except PermissionError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="PDF 文件被密码保护，无法读取"
-        )
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="无法识别表单字段，请确认这是一个标准表单"
-        )
-    
-    if not has_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="暂不支持扫描版PDF，请上传可编辑的PDF文件"
-        )
+    dispatcher = get_pdf_pipeline_dispatcher()
     
     # 提取字段名称列表
     try:
-        field_names = pdf_service.extract_form_fields(pdf_path)
-        field_details = pdf_service.get_field_details(pdf_path)
+        field_names, field_details = dispatcher.extract_fields(pdf_path)
     except PermissionError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="PDF 文件被密码保护，无法读取"
         )
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="无法识别表单字段，请确认这是一个标准表单"
+            detail="无法识别表单字段，请确认这是一个标准 PDF"
         )
     
     return ExtractFieldsResponse(
@@ -166,47 +180,26 @@ async def fill_pdf_with_ai(request: FillRequest):
     pdf_path = validate_file_exists(request.file_id)
     
     storage = get_storage()
-    pdf_service = get_pdf_service()
-    
-    # 1. 提取 PDF 表单字段
+    dispatcher = get_pdf_pipeline_dispatcher()
+
+    # 1. 分发到对应类型 pipeline（fillable/native）
+    # 2. pipeline 内部完成字段提取 + AI 匹配 + 填写
+    original_filename = storage.get_filename(request.file_id) or "document.pdf"
+    stem = Path(original_filename).stem
+    output_filename = f"{stem}_filled.pdf"
+    output_path = pdf_path.parent / output_filename
+
     try:
-        has_fields = pdf_service.has_form_fields(pdf_path)
+        result = await dispatcher.fill_with_ai(
+            pdf_path=pdf_path,
+            user_info=request.user_info,
+            output_path=output_path,
+        )
     except PermissionError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="PDF 文件被密码保护，无法读取"
+            detail="PDF 文件被密码保护，无法填写"
         )
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="无法识别表单字段，请确认这是一个标准表单"
-        )
-    
-    if not has_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="暂不支持扫描版PDF，请上传可编辑的PDF文件"
-        )
-    
-    try:
-        field_names = pdf_service.extract_form_fields(pdf_path)
-    except (PermissionError, ValueError) as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"无法识别表单字段，请确认这是一个标准表单: {str(e)}"
-        )
-    
-    # 2. AI 语义匹配
-    try:
-        ai_service = get_ai_service()
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
-    
-    try:
-        field_values = await ai_service.match_fields(field_names, request.user_info)
     except TimeoutError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -222,19 +215,10 @@ async def fill_pdf_with_ai(request: FillRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="填写失败，请检查输入信息或稍后重试"
         )
-    
-    # 3. 填写 PDF
-    original_filename = storage.get_filename(request.file_id) or "document.pdf"
-    stem = Path(original_filename).stem
-    output_filename = f"{stem}_filled.pdf"
-    output_path = pdf_path.parent / output_filename
-    
-    try:
-        result = pdf_service.fill_form(pdf_path, field_values, output_path)
-    except PermissionError:
+    except NotImplementedError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="PDF 文件被密码保护，无法填写"
+            detail=str(e)
         )
     except (ValueError, IOError):
         raise HTTPException(
@@ -277,7 +261,7 @@ async def fill_pdf_by_fields(request: FillByFieldsRequest):
     pdf_path = validate_file_exists(request.file_id)
     
     storage = get_storage()
-    pdf_service = get_pdf_service()
+    dispatcher = get_pdf_pipeline_dispatcher()
     
     # 生成输出文件名：原文件名_filled.pdf
     original_filename = storage.get_filename(request.file_id) or "document.pdf"
@@ -289,11 +273,20 @@ async def fill_pdf_by_fields(request: FillByFieldsRequest):
     
     # 填写表单
     try:
-        result = pdf_service.fill_form(pdf_path, request.field_values, output_path)
+        result = dispatcher.fill_by_fields(
+            pdf_path=pdf_path,
+            field_values=request.field_values,
+            output_path=output_path,
+        )
     except PermissionError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="PDF 文件被密码保护，无法填写"
+        )
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
         )
     except ValueError as e:
         raise HTTPException(

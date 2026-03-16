@@ -10,7 +10,7 @@ from openai import AsyncOpenAI
 
 from app.config import get_settings
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app.services.fillable.ai_service")
 
 
 class AIService(ABC):

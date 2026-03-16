@@ -64,6 +64,11 @@ npm run dev
 
 前端页面: http://localhost:3000
 
+开发端口约定（推荐）：
+- 前端：`http://localhost:3000`
+- 后端：`http://localhost:8000`
+- 前端通过 Vite 代理访问后端：`/api/* -> http://localhost:8000`
+
 ## 📁 项目结构
 
 ```
