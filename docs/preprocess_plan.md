@@ -2243,3 +2243,1152 @@ Section D:
 
 ---
 
+## 15. Preprocess v2 — Label-first 架构重构方案（2026-03-22）
+
+> **背景**：v1 基于 Instafill 的"每个 engine 独立产出完整 field"架构，经过 3 轮迭代（B-001 ~ B-020），
+> 代码膨胀至 2368 行，9 步修正流水线调试困难，且仍存在 018 大规模字段重复（78 vs 实际 25）、
+> 004 填写框重叠、019 头部假阳性等结构性问题。这些问题的根因不是单个 engine 的 bug，
+> 而是架构上允许多个 engine 对同一物理区域独立产出不同 field。
+>
+> **决策**：重构为 "Label-first" 两阶段架构：先统一收集 label 候选，再为每个 label 分配唯一 fill_rect。
+> YOLO/FFDNet 不引入（矢量检测已覆盖所有 Native PDF 场景，像素级精度不如 PDF 坐标级）。
+>
+> **原则**：
+> - label 宁多勿漏，VLM 阶段负责过滤假阳性
+> - 每个 label 有且仅有一个 fill_rect
+> - fill_rect 只能在 label 的右侧或下方
+> - 所有 fill_rect 之间不能重叠
+> - fill_rect 不能与矢量边界线重叠
+> - 不做人为的内部精细划分（no synthesize / no carve）
+
+### 15.1 架构总览
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  detect_page_v2()                     │
+│                                                       │
+│  Phase 1: 信息提取                                     │
+│  ├── extract_text_spans()        ← 复用 v1            │
+│  ├── _extract_text_lines()       ← 复用 v1            │
+│  ├── extract_drawings()          ← 复用 v1            │
+│  └── _build_table_grids()        ← 复用 v1            │
+│                                                       │
+│  Phase 2: Label 候选收集                               │
+│  ├── _collect_underline_labels()  ← 来源 A             │
+│  ├── _collect_colon_labels()      ← 来源 B             │
+│  ├── _collect_enum_labels()       ← 来源 C             │
+│  ├── _collect_table_labels()      ← 来源 D             │
+│  ├── _collect_dotleader_labels()  ← 来源 F             │
+│  └── 输出: raw_labels[]                               │
+│                                                       │
+│  Phase 3: Label 去重                                   │
+│  ├── _dedup_labels()                                  │
+│  └── 输出: unique_labels[]                            │
+│                                                       │
+│  Phase 4: Rect 分配                                    │
+│  ├── _assign_fill_rects()                             │
+│  ├── _resolve_rect_conflicts()                        │
+│  └── 输出: fields[] (label + fill_rect, 无重叠)        │
+│                                                       │
+│  Phase 5: Checkbox 处理（独立通道）                      │
+│  ├── _detect_checkboxes()         ← 复用 v1 engine3    │
+│  └── 输出: checkbox_fields[]                          │
+│                                                       │
+│  Phase 6: 后处理                                       │
+│  ├── _truncate_to_page()                              │
+│  ├── _final_sort()                                    │
+│  └── 输出: all_fields[]                               │
+│                                                       │
+└─────────────────────────────────────────────────────┘
+```
+
+### 15.2 数据结构定义
+
+#### Label 候选
+
+```python
+@dataclass
+class LabelCandidate:
+    text: str                  # 标签文本，如 "1. Name (Last, First, Middle Initial)"
+    bbox: RectTuple            # 标签文字的 bounding box (x0, y0, x1, y1)
+    source: str                # 来源标记: "underline" | "colon" | "enum" | "table" | "dotleader"
+    confidence: float          # 置信度 0.0-1.0
+    page_num: int
+    # 附加上下文（辅助 rect 分配）
+    underline_bbox: RectTuple | None = None   # 如果来源是 underline，记录下划线几何
+    table_cell_bbox: RectTuple | None = None  # 如果来源是 table，记录所属单元格边界
+    dotleader_end_x: float | None = None      # 如果来源是 dotleader，记录点线终点 x
+```
+
+#### 最终输出 Field
+
+```python
+# 与 v1 保持接口兼容
+field = {
+    "field_id": "p1_f001",
+    "label": "1. Name (Last, First, Middle Initial)",
+    "label_bbox": (21.6, 106.2, 139.7, 115.2),
+    "fill_rect": (142.0, 106.2, 370.0, 127.1),
+    "field_type": "text",        # "text" | "checkbox"
+    "source": "underline",       # label 来源
+    "confidence": 0.74,
+    "page_num": 1,
+}
+```
+
+### 15.3 Phase 1: 信息提取（完全复用 v1）
+
+以下方法**原样保留**，不做任何修改：
+
+| 方法 | 功能 | v1 行号 |
+|------|------|---------|
+| `_round`, `_rect_tuple`, `_bbox_union`, `_bbox_center`, `_bbox_width`, `_bbox_height` | 几何工具 | 90-126 |
+| `_is_valid_rect`, `_intersects`, `_overlap_ratio` | 几何判定 | 124-148 |
+| `_cluster_values` | 坐标聚类 | 150-161 |
+| `_normalize_text`, `_word_count`, `_slug` | 文本工具 | 163-180 |
+| `_is_checkbox_glyph` | checkbox 字符判定 | 182-189 |
+| `_is_instructional_text`, `_is_likely_running_text` | 文本过滤 | 191-210 |
+| `_is_section_header` | 段标题判定 | 212-223 |
+| `_line_overlap_ratio` | 一维重叠率 | 225-233 |
+| `_char_text` | pdfplumber 字符文本 | 235-236 |
+| `_is_toc_page` | 目录页判定 | 238-252 |
+| `_has_text_above_rect` | 上方文字检查 | 254-274 |
+| `_color_is_black_or_white` | 颜色判定 | 276-288 |
+| `_rect_distance` | 矩形距离 | 290-294 |
+| `_safe_float` | 安全浮点 | 296-300 |
+| `extract_text_spans` | 文字片段提取 | 302-323 |
+| `_extract_text_lines` | 文字行提取 | 325-353 |
+| `extract_drawings` | 矢量元素提取 | 355-430 |
+| `_merge_horizontal_lines`, `_merge_vertical_lines` | 线段合并 | 432-470 |
+| `_dedup_boxes` | 小方框去重 | 472-486 |
+| `_is_decorative_rect` | 装饰框判定 | 488-494 |
+| `_build_table_grids` | 表格网格构建 | 1135-1276 |
+| `_estimate_line_height` | 行高推算 | 557-572 |
+| `_infer_field_type` | 字段类型推断 | 614-628 |
+
+**删除的方法**（v2 不再需要）：
+
+| v1 方法 | 原因 |
+|---------|------|
+| `_find_label_for_rect` | 被 Phase 2 的 label 收集替代 |
+| `_find_label_for_underline` | 被 `_collect_underline_labels` 替代 |
+| `_find_label_for_cell` | 被 `_collect_table_labels` 替代 |
+| `_dedup_rect_candidates` | 被 Phase 3 label 去重替代 |
+| `_line_is_table_border` | 被 Phase 4 的矢量边界检查替代 |
+| `engine1_detect_boxes` | 不再存在（拆分为 label 收集 + rect 分配）|
+| `engine2_detect_blanks` | 被 `_collect_dotleader_labels` + rect 分配替代 |
+| `engine4_synthesize_table_fields` | 被 `_collect_table_labels` + rect 分配替代 |
+| `_classify_cell` | 简化为 Phase 2 的 table label 判定 |
+| `_find_neighbor_cell` | 不再需要 |
+| `_find_right_underline_for_line` | 合并到 rect 分配 |
+| `_is_prompt_like_label` | 合并到 label 收集规则 |
+| `_find_prompt_horizontal_bounds` | 合并到 rect 分配 |
+| `_extract_prompt_below_blank_fields` | 合并到 rect 分配 |
+| `_extract_subfields_from_enumerated_label_cell` | 合并到 `_collect_enum_labels` |
+| `_merge_engine4_same_label_cells` | 不再需要（Phase 3 去重解决） |
+| `_step1_synthesize` ~ `_step9_sort` | 删除全部 9 步修正 |
+| `correct_fields` | 删除（被 Phase 4 约束 + Phase 6 后处理替代）|
+
+### 15.4 Phase 2: Label 候选收集
+
+#### 15.4.1 来源 A: 矢量下划线标签 — `_collect_underline_labels()`
+
+```python
+def _collect_underline_labels(
+    self,
+    text_lines: List[Dict],
+    text_spans: List[Dict],
+    drawing_data: Dict,
+    tables: List[Dict],
+    page_num: int,
+) -> List[LabelCandidate]:
+    """从矢量下划线的左侧/上方收集标签。"""
+    labels = []
+    h_lines = drawing_data["horizontal_lines"]
+
+    for ln in h_lines:
+        x0, x1, y = ln["x0"], ln["x1"], ln["y"]
+        line_len = x1 - x0
+
+        # 跳过太短的线段
+        if line_len < self.ENGINE1_UNDERLINE_MIN_W:
+            continue
+
+        # 跳过属于表格边框的线段
+        if self._is_table_border_line(ln, tables):
+            continue
+
+        # 在下划线左侧找标签
+        best_label = self._find_text_left_of(
+            text_spans, x0, y,
+            max_gap=80.0,
+            y_tolerance=8.0,
+        )
+
+        if best_label:
+            text = best_label["text"]
+            if self._is_instructional_text(text):
+                continue
+            if self._is_likely_running_text(text):
+                continue
+
+            labels.append(LabelCandidate(
+                text=text,
+                bbox=best_label["bbox"],
+                source="underline",
+                confidence=0.74,
+                page_num=page_num,
+                underline_bbox=(x0, y - 1.0, x1, y + 1.0),
+            ))
+        else:
+            above_label = self._find_text_above(
+                text_lines, x0, x1, y,
+                max_gap=20.0,
+            )
+            label_text = above_label["text"] if above_label else "underline_field"
+            label_bbox = above_label["bbox"] if above_label else (x0, y - 12.0, x0 + 40.0, y)
+
+            labels.append(LabelCandidate(
+                text=label_text,
+                bbox=label_bbox,
+                source="underline",
+                confidence=0.50,
+                page_num=page_num,
+                underline_bbox=(x0, y - 1.0, x1, y + 1.0),
+            ))
+
+    return labels
+```
+
+**辅助方法：**
+
+```python
+def _find_text_left_of(
+    self,
+    text_spans: List[Dict],
+    target_x0: float,
+    target_y: float,
+    max_gap: float = 80.0,
+    y_tolerance: float = 8.0,
+) -> Dict | None:
+    """找 target_x0 左侧、垂直对齐的最近文字片段。"""
+    candidates = []
+    for sp in text_spans:
+        sp_bbox = sp["bbox"]
+        sp_x1 = sp_bbox[2]
+        sp_cy = (sp_bbox[1] + sp_bbox[3]) / 2.0
+        if sp_x1 > target_x0 + 2.0:
+            continue
+        if target_x0 - sp_x1 > max_gap:
+            continue
+        if abs(sp_cy - target_y) > y_tolerance:
+            continue
+        candidates.append((target_x0 - sp_x1, sp))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1]
+
+
+def _find_text_above(
+    self,
+    text_lines: List[Dict],
+    x0: float, x1: float, y: float,
+    max_gap: float = 20.0,
+) -> Dict | None:
+    """找 (x0,x1,y) 区域上方、水平重叠的最近文字行。"""
+    candidates = []
+    for tl in text_lines:
+        tl_bbox = tl["bbox"]
+        tl_y1 = tl_bbox[3]
+        if tl_y1 > y + 2.0:
+            continue
+        if y - tl_y1 > max_gap:
+            continue
+        overlap = self._line_overlap_ratio(x0, x1, tl_bbox[0], tl_bbox[2])
+        if overlap < 0.1:
+            continue
+        candidates.append((y - tl_y1, tl))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1]
+
+
+def _is_table_border_line(
+    self,
+    ln: Dict[str, float],
+    tables: List[Dict],
+) -> bool:
+    """判断一条水平线段是否属于某个表格的网格线。"""
+    lx0, lx1, ly = ln["x0"], ln["x1"], ln["y"]
+    for table in tables:
+        grid_y = set(table.get("grid_y", []))
+        grid_x_min = min(table.get("grid_x", [0.0]))
+        grid_x_max = max(table.get("grid_x", [0.0]))
+        for gy in grid_y:
+            if abs(ly - gy) < 3.0 and lx0 >= grid_x_min - 5.0 and lx1 <= grid_x_max + 5.0:
+                return True
+    return False
+```
+
+#### 15.4.2 来源 B: 冒号标签 — `_collect_colon_labels()`
+
+```python
+def _collect_colon_labels(
+    self,
+    text_spans: List[Dict],
+    text_lines: List[Dict],
+    page_num: int,
+) -> List[LabelCandidate]:
+    """收集以冒号结尾的文字片段作为标签候选。"""
+    labels = []
+
+    for sp in text_spans:
+        text = sp["text"].strip()
+        if not re.search(r':\s*$', text):
+            continue
+        if self._is_instructional_text(text):
+            continue
+        if self._is_likely_running_text(text):
+            continue
+        if len(text) > self.MAX_LABEL_LEN:
+            continue
+
+        labels.append(LabelCandidate(
+            text=text,
+            bbox=sp["bbox"],
+            source="colon",
+            confidence=0.70,
+            page_num=page_num,
+        ))
+
+    return labels
+```
+
+#### 15.4.3 来源 C: 编号标签 — `_collect_enum_labels()`
+
+```python
+def _collect_enum_labels(
+    self,
+    text_lines: List[Dict],
+    page_num: int,
+) -> List[LabelCandidate]:
+    """收集以编号开头的文字行作为标签候选。
+    匹配模式: "1.", "1)", "a.", "a)", "A.", "A)"
+    """
+    labels = []
+
+    for tl in text_lines:
+        text = tl["text"].strip()
+        if not self.ENUM_PREFIX_RE.match(text):
+            continue
+        if self._is_instructional_text(text):
+            continue
+        content_after_prefix = self.ENUM_PREFIX_RE.sub("", text).strip()
+        if len(content_after_prefix) < 2:
+            continue
+
+        labels.append(LabelCandidate(
+            text=text,
+            bbox=tl["bbox"],
+            source="enum",
+            confidence=0.65,
+            page_num=page_num,
+        ))
+
+    return labels
+```
+
+#### 15.4.4 来源 D: 表格单元格标签 — `_collect_table_labels()`
+
+```python
+def _collect_table_labels(
+    self,
+    text_lines: List[Dict],
+    tables: List[Dict],
+    page_num: int,
+) -> List[LabelCandidate]:
+    """从表格单元格中收集标签。
+    规则：单元格内有文字的，文字部分即为标签。
+    """
+    labels = []
+
+    for table in tables:
+        grid_x = table.get("grid_x", [])
+        grid_y = table.get("grid_y", [])
+        if len(grid_x) < 2 or len(grid_y) < 2:
+            continue
+
+        for r in range(len(grid_y) - 1):
+            for c in range(len(grid_x) - 1):
+                cell_bbox = (grid_x[c], grid_y[r], grid_x[c + 1], grid_y[r + 1])
+                cell_w = cell_bbox[2] - cell_bbox[0]
+                cell_h = cell_bbox[3] - cell_bbox[1]
+
+                if cell_w < self.MIN_FIELD_WIDTH or cell_h < self.MIN_FIELD_HEIGHT:
+                    continue
+
+                cell_texts = self._get_cell_text_lines(cell_bbox, text_lines)
+                if not cell_texts:
+                    continue
+
+                combined_text = " ".join(t["text"] for t in cell_texts)
+                if self._is_instructional_text(combined_text):
+                    continue
+                if len(combined_text) > self.MAX_LABEL_LEN:
+                    continue
+
+                text_area = sum(
+                    self._bbox_width(t["bbox"]) * self._bbox_height(t["bbox"])
+                    for t in cell_texts
+                )
+                cell_area = cell_w * cell_h
+                text_ratio = text_area / cell_area if cell_area > 0 else 0
+                is_header_only = text_ratio > self.CELL_FILLABLE_BLANK_RATIO
+
+                labels.append(LabelCandidate(
+                    text=combined_text,
+                    bbox=cell_texts[0]["bbox"],
+                    source="table",
+                    confidence=0.66 if not is_header_only else 0.45,
+                    page_num=page_num,
+                    table_cell_bbox=cell_bbox,
+                ))
+
+    return labels
+```
+
+#### 15.4.5 来源 F: Dot-leader 标签 — `_collect_dotleader_labels()`
+
+```python
+def _collect_dotleader_labels(
+    self,
+    pdf_path: str,
+    page_num: int,
+    page_rect: RectTuple,
+    existing_labels: List[LabelCandidate],
+    text_lines: List[Dict],
+) -> List[LabelCandidate]:
+    """
+    从 pdfplumber 字符级数据中检测 dot-leader 模式（如 Name......）。
+    触发条件：engine1 下划线标签数 <= 2 条，且非 TOC 页。
+    """
+    labels = []
+
+    import pdfplumber
+    pdf = pdfplumber.open(pdf_path)
+    if page_num > len(pdf.pages):
+        pdf.close()
+        return labels
+
+    plb_page = pdf.pages[page_num - 1]
+    chars = plb_page.chars
+
+    # 按行分组字符（y 坐标聚类）
+    # 复用 v1 engine2 的字符行分组逻辑
+
+    for line_chars in char_lines:
+        # 检测连续的点号序列（>= DOT_LEADER_MIN_COUNT 个 "."）
+        dot_runs = self._find_dot_runs(line_chars)
+
+        for dot_run in dot_runs:
+            left_chars = [c for c in line_chars if c["x1"] <= dot_run["x0"] + 2.0]
+            if not left_chars:
+                continue
+
+            label_text = "".join(self._char_text(c) for c in left_chars).strip()
+            if not label_text or len(label_text) < 2:
+                continue
+
+            label_x0 = min(c["x0"] for c in left_chars)
+            label_y0 = min(c["top"] for c in left_chars)
+            label_x1 = max(c["x1"] for c in left_chars)
+            label_y1 = max(c["bottom"] for c in left_chars)
+
+            labels.append(LabelCandidate(
+                text=label_text,
+                bbox=(label_x0, label_y0, label_x1, label_y1),
+                source="dotleader",
+                confidence=0.90,
+                page_num=page_num,
+                dotleader_end_x=dot_run["x1"],
+            ))
+
+    pdf.close()
+    return labels
+```
+
+#### 15.4.6 Dot-leader 触发条件
+
+```python
+# 在 detect_page_v2 中：
+underline_label_count = sum(1 for lb in all_labels if lb.source == "underline")
+is_toc = self._is_toc_page(text_lines, page_width=self._bbox_width(page_rect))
+
+if (underline_label_count <= 2) and not is_toc:
+    dotleader_labels = self._collect_dotleader_labels(
+        pdf_path, page_num, page_rect, all_labels, text_lines,
+    )
+    all_labels.extend(dotleader_labels)
+```
+
+### 15.5 Phase 3: Label 去重 — `_dedup_labels()`
+
+```python
+def _dedup_labels(self, labels: List[LabelCandidate]) -> List[LabelCandidate]:
+    """
+    对 label 候选进行去重。
+    规则：如果两个 label 的文本相似（子串关系）且位置接近（中心距 < 15pt），
+    保留置信度更高的那个。
+    """
+    if not labels:
+        return []
+
+    sorted_labels = sorted(labels, key=lambda lb: -lb.confidence)
+    kept: List[LabelCandidate] = []
+
+    for lb in sorted_labels:
+        is_dup = False
+        for existing in kept:
+            cx1 = (lb.bbox[0] + lb.bbox[2]) / 2.0
+            cy1 = (lb.bbox[1] + lb.bbox[3]) / 2.0
+            cx2 = (existing.bbox[0] + existing.bbox[2]) / 2.0
+            cy2 = (existing.bbox[1] + existing.bbox[3]) / 2.0
+            dist = math.sqrt((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2)
+
+            if dist > 15.0:
+                continue
+
+            t1 = lb.text.strip().lower()
+            t2 = existing.text.strip().lower()
+            if t1 == t2 or t1 in t2 or t2 in t1:
+                is_dup = True
+                break
+
+        if not is_dup:
+            kept.append(lb)
+
+    return kept
+```
+
+**关键设计说明：**
+- 去重发生在 label 文本层面，而非几何框层面，比 v1 的 `_step7_dedup`（rect 重叠率比较）简单且可靠得多。
+- `dist > 15.0` 的阈值足够宽松——同一个字段的文字在不同 text_span 中的位置偏差通常 < 5pt。
+- 子串关系判定（`t1 in t2`）处理了"完整文字 vs 截断文字"的情况。
+
+### 15.6 Phase 4: Rect 分配 — `_assign_fill_rects()`
+
+这是 v2 的核心方法，替代 v1 的全部 4 个 engine 的 rect 产出逻辑 + 9 步修正。
+
+```python
+def _assign_fill_rects(
+    self,
+    labels: List[LabelCandidate],
+    drawing_data: Dict,
+    tables: List[Dict],
+    text_lines: List[Dict],
+    text_spans: List[Dict],
+    page_rect: RectTuple,
+) -> List[Dict]:
+    """
+    为每个 label 分配恰好一个 fill_rect。
+    策略按优先级：
+      1. label 有 underline_bbox → rect = 下划线区域
+      2. label 有 table_cell_bbox → rect = 同行右侧空白 or 下方空白
+      3. label 有 dotleader_end_x → rect = label 右端到 dotleader 终点
+      4. label 右侧有空白 → rect = 右侧空白
+      5. label 下方有空白 → rect = 下方空白到下一个元素
+      6. 无法分配 → 丢弃该 label
+    """
+    fields = []
+    v_lines = drawing_data.get("vertical_lines", [])
+    h_lines = drawing_data.get("horizontal_lines", [])
+
+    sorted_labels = sorted(labels, key=lambda lb: (lb.bbox[1], lb.bbox[0]))
+
+    for i, lb in enumerate(sorted_labels):
+        rect = None
+
+        # === 策略 1: 下划线 ===
+        if lb.underline_bbox is not None:
+            ul = lb.underline_bbox
+            line_height = self._estimate_line_height(lb.bbox, text_spans, ul[1])
+            rect = (
+                max(lb.bbox[2] + 2.0, ul[0]),
+                ul[1] - line_height,
+                ul[2],
+                ul[3],
+            )
+
+        # === 策略 2: 表格单元格 ===
+        elif lb.table_cell_bbox is not None:
+            rect = self._calc_table_cell_rect(lb, tables, text_lines)
+
+        # === 策略 3: Dot-leader ===
+        elif lb.dotleader_end_x is not None:
+            rect = (
+                lb.bbox[2] + 2.0,
+                lb.bbox[1],
+                lb.dotleader_end_x,
+                lb.bbox[3],
+            )
+
+        # === 策略 4: 右侧空白 ===
+        else:
+            rect = self._find_right_blank(lb, text_spans, v_lines, page_rect)
+
+        # === 策略 5: 下方空白 (fallback) ===
+        if rect is None:
+            rect = self._find_below_blank(lb, text_lines, h_lines, page_rect)
+
+        # === 无法分配 → 丢弃 ===
+        if rect is None:
+            continue
+
+        # === 基本验证 ===
+        rect_w = rect[2] - rect[0]
+        rect_h = rect[3] - rect[1]
+        if rect_w < self.MIN_FIELD_WIDTH or rect_h < self.MIN_FIELD_HEIGHT:
+            continue
+
+        fields.append({
+            "label": lb.text,
+            "label_bbox": lb.bbox,
+            "fill_rect": rect,
+            "field_type": self._infer_field_type(lb.text),
+            "source": lb.source,
+            "confidence": lb.confidence,
+            "page_num": lb.page_num,
+        })
+
+    # === 冲突解决: 消除 fill_rect 重叠 ===
+    fields = self._resolve_rect_conflicts(fields)
+
+    return fields
+```
+
+#### 15.6.1 表格单元格 rect 计算 — `_calc_table_cell_rect()`
+
+```python
+def _calc_table_cell_rect(
+    self,
+    lb: LabelCandidate,
+    tables: List[Dict],
+    text_lines: List[Dict],
+) -> RectTuple | None:
+    """
+    为表格内的标签分配 fill_rect。
+    规则：
+      a. 标签只占单元格左侧部分 → rect = 文字右侧到单元格右边界
+      b. 标签占满单元格 → 右侧相邻单元格为空 → rect = 右侧单元格
+      c. 标签占满且右侧无空 → 下方有空行 → rect = 下方区域
+      d. 都不成立 → 返回 None
+    """
+    cell = lb.table_cell_bbox
+    if cell is None:
+        return None
+
+    cell_x0, cell_y0, cell_x1, cell_y1 = cell
+    label_x1 = lb.bbox[2]
+    padding = 2.0
+
+    right_space = cell_x1 - label_x1
+
+    # 情况 a
+    if right_space > self.MIN_FIELD_WIDTH:
+        return (label_x1 + padding, cell_y0 + padding, cell_x1 - padding, cell_y1 - padding)
+
+    # 情况 b
+    right_cell = self._find_right_empty_cell(cell, tables, text_lines)
+    if right_cell is not None:
+        return (right_cell[0] + padding, right_cell[1] + padding,
+                right_cell[2] - padding, right_cell[3] - padding)
+
+    # 情况 c
+    below_space = self._find_below_empty_in_table(cell, tables, text_lines)
+    if below_space is not None:
+        return below_space
+
+    return None
+```
+
+辅助方法 `_find_right_empty_cell` 和 `_find_below_empty_in_table`：
+
+```python
+def _find_right_empty_cell(
+    self, cell_bbox: RectTuple, tables: List[Dict], text_lines: List[Dict],
+) -> RectTuple | None:
+    """找给定单元格右侧的空单元格。"""
+    cx1 = cell_bbox[2]
+    cy0, cy1 = cell_bbox[1], cell_bbox[3]
+    for table in tables:
+        grid_x = table.get("grid_x", [])
+        grid_y = table.get("grid_y", [])
+        for r in range(len(grid_y) - 1):
+            for c in range(len(grid_x) - 1):
+                rc = (grid_x[c], grid_y[r], grid_x[c + 1], grid_y[r + 1])
+                if abs(rc[0] - cx1) < 3.0 and abs(rc[1] - cy0) < 3.0:
+                    cell_texts = self._get_cell_text_lines(rc, text_lines)
+                    if not cell_texts:
+                        return rc
+    return None
+
+
+def _find_below_empty_in_table(
+    self, cell_bbox: RectTuple, tables: List[Dict], text_lines: List[Dict],
+) -> RectTuple | None:
+    """在表格内找给定单元格下方同列的空白区域。"""
+    cx0, cy1, cx1 = cell_bbox[0], cell_bbox[3], cell_bbox[2]
+    padding = 2.0
+    for table in tables:
+        grid_x = table.get("grid_x", [])
+        grid_y = table.get("grid_y", [])
+        for r in range(len(grid_y) - 1):
+            for c in range(len(grid_x) - 1):
+                rc = (grid_x[c], grid_y[r], grid_x[c + 1], grid_y[r + 1])
+                if abs(rc[0] - cx0) < 3.0 and abs(rc[2] - cx1) < 3.0 and abs(rc[1] - cy1) < 3.0:
+                    cell_texts = self._get_cell_text_lines(rc, text_lines)
+                    if not cell_texts:
+                        return (rc[0] + padding, rc[1] + padding, rc[2] - padding, rc[3] - padding)
+    return None
+```
+
+#### 15.6.2 右侧空白查找 — `_find_right_blank()`
+
+```python
+def _find_right_blank(
+    self, lb: LabelCandidate, text_spans: List[Dict],
+    v_lines: List[Dict], page_rect: RectTuple,
+) -> RectTuple | None:
+    """
+    在 label 右侧找空白区域作为 fill_rect。
+    右边界截断优先级：
+      1. 同行下一个 label 的左边界 - 2pt
+      2. 最近的矢量竖线
+      3. 页面右边界 - 20pt
+    """
+    label_x1 = lb.bbox[2]
+    label_y0, label_y1 = lb.bbox[1], lb.bbox[3]
+    label_cy = (label_y0 + label_y1) / 2.0
+
+    right_cap = page_rect[2] - 20.0
+
+    # 同行下一个文字
+    next_text_x0 = None
+    for sp in text_spans:
+        sp_bbox = sp["bbox"]
+        sp_cy = (sp_bbox[1] + sp_bbox[3]) / 2.0
+        if abs(sp_cy - label_cy) < 8.0 and sp_bbox[0] > label_x1 + 5.0:
+            if next_text_x0 is None or sp_bbox[0] < next_text_x0:
+                next_text_x0 = sp_bbox[0]
+
+    if next_text_x0 is not None:
+        right_cap = min(right_cap, next_text_x0 - 2.0)
+
+    # 最近的矢量竖线
+    for vl in v_lines:
+        vx = vl["x"]
+        vy0, vy1 = vl["y0"], vl["y1"]
+        if vx > label_x1 + 5.0 and vy0 <= label_y1 and vy1 >= label_y0:
+            if vx < right_cap:
+                right_cap = vx - 2.0
+
+    blank_width = right_cap - label_x1 - 2.0
+    if blank_width < self.MIN_FIELD_WIDTH:
+        return None
+
+    return (label_x1 + 2.0, label_y0, right_cap, label_y1)
+```
+
+#### 15.6.3 下方空白查找 — `_find_below_blank()`
+
+```python
+def _find_below_blank(
+    self, lb: LabelCandidate, text_lines: List[Dict],
+    h_lines: List[Dict], page_rect: RectTuple,
+) -> RectTuple | None:
+    """
+    在 label 下方找空白区域。
+    下边界截断优先级：
+      1. 最近的水平线段
+      2. 下一个文字行的上边界
+      3. label 下方 40pt（默认一行）
+    """
+    label_x0 = lb.bbox[0]
+    label_y1 = lb.bbox[3]
+    label_x1 = lb.bbox[2]
+
+    bottom_cap = label_y1 + 40.0
+
+    for hl in h_lines:
+        hy = hl["y"]
+        if hy > label_y1 + 3.0 and hy < bottom_cap:
+            if hl["x0"] <= label_x1 and hl["x1"] >= label_x0:
+                bottom_cap = hy - 2.0
+
+    for tl in text_lines:
+        tl_y0 = tl["bbox"][1]
+        if tl_y0 > label_y1 + 3.0 and tl_y0 < bottom_cap:
+            overlap = self._line_overlap_ratio(label_x0, label_x1, tl["bbox"][0], tl["bbox"][2])
+            if overlap > 0.1:
+                bottom_cap = tl_y0 - 2.0
+
+    if bottom_cap - label_y1 > self.PROMPT_FALLBACK_MAX_HEIGHT:
+        bottom_cap = label_y1 + self.PROMPT_FALLBACK_MAX_HEIGHT
+
+    right_cap = page_rect[2] - 20.0
+    width = right_cap - label_x0
+    if width < self.PROMPT_FALLBACK_MIN_WIDTH:
+        return None
+
+    height = bottom_cap - label_y1
+    if height < self.MIN_FIELD_HEIGHT:
+        return None
+
+    return (label_x0, label_y1 + 2.0, right_cap, bottom_cap)
+```
+
+#### 15.6.4 冲突解决 — `_resolve_rect_conflicts()`
+
+```python
+def _resolve_rect_conflicts(self, fields: List[Dict]) -> List[Dict]:
+    """
+    消除 fill_rect 之间的重叠。
+    策略 A：按 label 的 x 坐标从左到右分配空间，
+    每个 label 的 fill_rect 右边界不能超过下一个 label（同行）的 fill_rect 左边界。
+    """
+    if len(fields) <= 1:
+        return fields
+
+    # 按 y 分行
+    rows: List[List[int]] = []
+    used = [False] * len(fields)
+
+    for i in range(len(fields)):
+        if used[i]:
+            continue
+        row = [i]
+        used[i] = True
+        iy = (fields[i]["fill_rect"][1] + fields[i]["fill_rect"][3]) / 2.0
+        for j in range(i + 1, len(fields)):
+            if used[j]:
+                continue
+            jy = (fields[j]["fill_rect"][1] + fields[j]["fill_rect"][3]) / 2.0
+            if abs(iy - jy) < 8.0:
+                row.append(j)
+                used[j] = True
+        rows.append(row)
+
+    # 同行内按 label x0 排序并裁剪
+    for row in rows:
+        row.sort(key=lambda idx: fields[idx]["label_bbox"][0])
+        for k in range(len(row) - 1):
+            curr_idx = row[k]
+            next_idx = row[k + 1]
+            curr_rect = list(fields[curr_idx]["fill_rect"])
+            next_label_x0 = fields[next_idx]["label_bbox"][0]
+
+            if curr_rect[2] > next_label_x0 - 2.0:
+                curr_rect[2] = next_label_x0 - 2.0
+
+            if curr_rect[2] - curr_rect[0] < self.MIN_FIELD_WIDTH:
+                fields[curr_idx]["_discard"] = True
+            else:
+                fields[curr_idx]["fill_rect"] = tuple(curr_rect)
+
+    # 跨行重叠检查
+    for i in range(len(fields)):
+        if fields[i].get("_discard"):
+            continue
+        for j in range(i + 1, len(fields)):
+            if fields[j].get("_discard"):
+                continue
+            overlap = self._overlap_ratio(fields[i]["fill_rect"], fields[j]["fill_rect"])
+            if overlap > 0.3:
+                if fields[i]["confidence"] >= fields[j]["confidence"]:
+                    fields[j]["_discard"] = True
+                else:
+                    fields[i]["_discard"] = True
+
+    return [f for f in fields if not f.get("_discard")]
+```
+
+### 15.7 Phase 5: Checkbox 处理
+
+**完全复用 v1 的 `engine3_detect_checkboxes`**，不做修改。Checkbox 的检测逻辑与文本字段完全不同（基于小正方形 glyph），独立通道是正确的设计。
+
+### 15.8 Phase 6: 后处理
+
+v1 的 9 步修正流水线简化为 **3 步**：
+
+```python
+def _postprocess(self, text_fields, checkbox_fields, page_rect):
+    all_fields = text_fields + checkbox_fields
+    all_fields = self._truncate_to_page(all_fields, page_rect)
+    all_fields = self._final_dedup(all_fields)
+    all_fields = self._final_sort(all_fields)
+    for idx, field in enumerate(all_fields, start=1):
+        field["field_id"] = f"p{field['page_num']}_f{idx:03d}"
+    return all_fields
+
+
+def _truncate_to_page(self, fields, page_rect):
+    """截断超出页面边界的 fill_rect。"""
+    result = []
+    for f in fields:
+        r = list(f["fill_rect"])
+        r[0] = max(r[0], page_rect[0] + 1.0)
+        r[1] = max(r[1], page_rect[1] + 1.0)
+        r[2] = min(r[2], page_rect[2] - 1.0)
+        r[3] = min(r[3], page_rect[3] - 1.0)
+        if r[2] - r[0] >= self.MIN_FIELD_WIDTH and r[3] - r[1] >= self.MIN_FIELD_HEIGHT:
+            f["fill_rect"] = tuple(r)
+            result.append(f)
+    return result
+
+
+def _final_dedup(self, fields):
+    """最终去重：text_field 和 checkbox 重叠 > 50% 时保留 checkbox。"""
+    kept = []
+    for f in fields:
+        is_dup = False
+        for existing in kept:
+            overlap = self._overlap_ratio(f["fill_rect"], existing["fill_rect"])
+            if overlap > 0.5:
+                if existing.get("field_type") == "checkbox":
+                    is_dup = True
+                    break
+                elif f.get("field_type") == "checkbox":
+                    kept.remove(existing)
+                    break
+                else:
+                    if existing["confidence"] >= f["confidence"]:
+                        is_dup = True
+                        break
+                    else:
+                        kept.remove(existing)
+                        break
+        if not is_dup:
+            kept.append(f)
+    return kept
+
+
+def _final_sort(self, fields):
+    return sorted(fields, key=lambda f: (f["fill_rect"][1], f["fill_rect"][0]))
+```
+
+### 15.9 整合入口 — `detect_page_v2()`
+
+```python
+def detect_page_v2(self, page, page_num, pdf_path):
+    # Phase 1
+    text_spans = self.extract_text_spans(page, page_num)
+    text_lines = self._extract_text_lines(page, page_num)
+    drawing_data = self.extract_drawings(page, page_num)
+    tables = self._build_table_grids(drawing_data, page_num)
+    page_rect = self._rect_tuple(page.rect)
+
+    # Phase 2
+    all_labels = []
+    all_labels.extend(self._collect_underline_labels(text_lines, text_spans, drawing_data, tables, page_num))
+    all_labels.extend(self._collect_colon_labels(text_spans, text_lines, page_num))
+    all_labels.extend(self._collect_enum_labels(text_lines, page_num))
+    all_labels.extend(self._collect_table_labels(text_lines, tables, page_num))
+
+    # Dot-leader 条件触发
+    underline_count = sum(1 for lb in all_labels if lb.source == "underline")
+    is_toc = self._is_toc_page(text_lines, page_width=self._bbox_width(page_rect))
+    if underline_count <= 2 and not is_toc:
+        all_labels.extend(self._collect_dotleader_labels(pdf_path, page_num, page_rect, all_labels, text_lines))
+
+    # Phase 3
+    unique_labels = self._dedup_labels(all_labels)
+
+    # Phase 4
+    text_fields = self._assign_fill_rects(unique_labels, drawing_data, tables, text_lines, text_spans, page_rect)
+
+    # Phase 5
+    checkbox_fields = self._detect_checkboxes(page, page_num, text_spans, text_lines, drawing_data)
+
+    # Phase 6
+    all_fields = self._postprocess(text_fields, checkbox_fields, page_rect)
+
+    return {
+        "page_num": page_num,
+        "page_size": page_rect,
+        "text_spans": text_spans,
+        "text_lines": text_lines,
+        "table_structures": tables,
+        "detected_fields": all_fields,
+    }
+```
+
+### 15.10 代码组织
+
+```
+detector.py (~1200 行预估)
+├── 常量定义                          (~60 行, 复用 v1)
+├── 底层工具方法                      (~250 行, 复用 v1)
+├── 信息提取 (Phase 1)               (~200 行, 复用 v1)
+├── Label 收集 (Phase 2)             (~300 行, 新写)
+│   ├── _collect_underline_labels
+│   ├── _collect_colon_labels
+│   ├── _collect_enum_labels
+│   ├── _collect_table_labels
+│   ├── _collect_dotleader_labels
+│   └── 辅助: _find_text_left_of, _find_text_above, _is_table_border_line
+├── Label 去重 (Phase 3)             (~50 行, 新写)
+├── Rect 分配 (Phase 4)              (~250 行, 新写)
+│   ├── _assign_fill_rects
+│   ├── _calc_table_cell_rect
+│   ├── _find_right_blank, _find_below_blank
+│   ├── _find_right_empty_cell, _find_below_empty_in_table
+│   └── _resolve_rect_conflicts
+├── Checkbox 处理 (Phase 5)          (~100 行, 复用 v1 engine3)
+├── 后处理 (Phase 6)                 (~80 行, 简化自 v1)
+└── 入口                             (~40 行)
+```
+
+### 15.11 迁移策略
+
+1. **保留 v1 代码不删除**，v2 在同一文件中新增 `detect_page_v2` 方法
+2. `detect_all` 内部调用 `detect_page_v2` 替代 `detect_page`
+3. 测试通过后，删除 v1 独有的方法
+4. 接口不变：`detect_all` 返回格式完全兼容 v1，pipeline.py / pdf.py 无需修改
+
+### 15.12 v2 测试方案
+
+#### 15.12.1 测试目录结构
+
+```
+TestSpace/preprocess_test_v2/
+├── result_paths.py              # 复用 v1，路径不变
+├── viz_utils.py                 # 复用 v1，新增 v2 color_map
+├── test_phase2_labels.py        # Phase 2 单元测试：标签收集
+├── test_phase3_dedup.py         # Phase 3 单元测试：标签去重
+├── test_phase4_rects.py         # Phase 4 单元测试：rect 分配
+├── test_integration_v2.py       # 全流程整合测试
+└── test_constraints.py          # 约束验证测试（无重叠、1:1、右/下方）
+```
+
+#### 15.12.2 test_constraints.py — 约束验证测试
+
+```python
+"""验证 v2 输出满足所有硬性约束。"""
+
+def check_constraints(result: dict) -> dict:
+    violations = {
+        "no_fill_rect": [],            # 有 label 但没有 fill_rect
+        "rect_overlap": [],             # fill_rect 之间重叠
+        "rect_left_of_label": [],       # fill_rect 在 label 左侧
+        "duplicate_label": [],          # 同页重复 label
+        "rect_exceeds_page": [],        # fill_rect 超出页面
+    }
+
+    for page_data in result["pages"]:
+        fields = page_data["detected_fields"]
+        page_rect = page_data["page_size"]
+
+        for f in fields:
+            if "fill_rect" not in f:
+                violations["no_fill_rect"].append(f["field_id"])
+                continue
+
+            fr = f["fill_rect"]
+            lb = f.get("label_bbox")
+
+            # fill_rect 不在 label 左侧（checkbox 例外）
+            if lb and f.get("field_type") != "checkbox":
+                if fr[2] < lb[0]:
+                    violations["rect_left_of_label"].append(f["field_id"])
+
+            # fill_rect 不超出页面
+            if fr[0] < page_rect[0] - 1 or fr[1] < page_rect[1] - 1 or \
+               fr[2] > page_rect[2] + 1 or fr[3] > page_rect[3] + 1:
+                violations["rect_exceeds_page"].append(f["field_id"])
+
+        # fill_rect 之间不重叠（> 5% 即违规）
+        for i in range(len(fields)):
+            for j in range(i + 1, len(fields)):
+                if "fill_rect" not in fields[i] or "fill_rect" not in fields[j]:
+                    continue
+                # 使用 NativeDetector._overlap_ratio
+                a, b = fields[i]["fill_rect"], fields[j]["fill_rect"]
+                inter_x = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+                inter_y = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+                inter_area = inter_x * inter_y
+                area_a = (a[2] - a[0]) * (a[3] - a[1])
+                area_b = (b[2] - b[0]) * (b[3] - b[1])
+                min_area = min(area_a, area_b)
+                if min_area > 0 and inter_area / min_area > 0.05:
+                    violations["rect_overlap"].append(
+                        f"{fields[i]['field_id']} vs {fields[j]['field_id']}"
+                    )
+
+        # 同页重复 label
+        label_texts = [f.get("label", "") for f in fields if f.get("field_type") != "checkbox"]
+        seen = {}
+        for lt in label_texts:
+            if lt in seen:
+                violations["duplicate_label"].append(f"page {page_data['page_num']}: '{lt[:40]}'")
+            seen[lt] = True
+
+    return violations
+```
+
+#### 15.12.3 test_integration_v2.py — 全流程整合测试
+
+与 v1 的 `test_all_engines.py` 基本一致，但增加自动约束检查。每份 PDF 运行后自动执行 `check_constraints` 并在终端打印 PASS/FAIL。
+
+#### 15.12.4 viz_utils.py v2 color_map
+
+```python
+V2_COLOR_MAP = {
+    "underline": (0.0, 0.5, 0.0),     # 深绿
+    "colon": (0.0, 0.7, 0.0),         # 亮绿
+    "enum": (0.2, 0.6, 0.2),          # 中绿
+    "table": (0.1, 0.6, 0.9),         # 青色
+    "dotleader": (1.0, 0.5, 0.0),     # 橙色
+    "engine3_checkbox": (0.9, 0.0, 0.0),  # 红色
+}
+```
+
+### 15.13 验收标准（Gate）
+
+| Gate | 条件 | 说明 |
+|------|------|------|
+| **Gate 1** | 每页假阳性 ≤ 25% | 人工复核标注 PDF |
+| **Gate 2** | 核心字段命中 ≥ 90% | 见 14.7 的字段清单（008/013/018/019）|
+| **Gate 3** | 单页字段数 ≤ 100 | 超过说明有系统性 bug |
+| **Gate 4** | `test_constraints.py` 全部 PASS | 无重叠、无超出页面、无 fill_rect 缺失 |
+| **Gate 5** | 018 Page 1 字段数 ≤ 40 | v1 为 78（大量重复），v2 应降至 ~25 |
+
+### 15.14 执行步骤
+
+```
+步骤 1: 创建 TestSpace/preprocess_test_v2/ 目录，复制 result_paths.py 和 viz_utils.py
+步骤 2: 在 detector.py 中新增 LabelCandidate dataclass
+步骤 3: 实现 Phase 2 的 5 个 _collect_*_labels 方法
+步骤 4: 运行 test_phase2_labels.py 验证标签收集完整性
+步骤 5: 实现 Phase 3 _dedup_labels
+步骤 6: 实现 Phase 4 _assign_fill_rects + _resolve_rect_conflicts
+步骤 7: 实现 Phase 6 后处理
+步骤 8: 实现 detect_page_v2 整合入口
+步骤 9: 运行 test_integration_v2.py --batch 全量测试
+步骤 10: 运行 test_constraints.py 验证所有约束
+步骤 11: 人工复核 6 份 PDF 的标注可视化
+步骤 12: Gate 全部通过后，删除 v1 独有方法，清理代码
+```
+
+### 15.15 风险与缓解
+
+| 风险 | 概率 | 影响 | 缓解 |
+|------|------|------|------|
+| Phase 2 标签收集遗漏某些字段 | 中 | 高 | test_phase2_labels.py 逐页检查 + 人工复核标注 PDF |
+| Phase 4 对复杂表格布局不如 v1 engine4 | 中 | 中 | _calc_table_cell_rect 保留核心逻辑 |
+| checkbox 与 text_field 去重问题 | 低 | 低 | _final_dedup 中 checkbox 优先 |
+| pipeline.py 接口断裂 | 低 | 高 | detect_all 返回格式完全兼容 |
+
