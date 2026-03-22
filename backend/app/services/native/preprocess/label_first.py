@@ -60,6 +60,96 @@ class LabelFirstMixin:
                 return True
         return False
 
+    def _find_table_cell_for_line(
+        self,
+        line_bbox: RectTuple,
+        tables: List[Dict[str, Any]],
+    ) -> RectTuple | None:
+        cx = (line_bbox[0] + line_bbox[2]) / 2.0
+        cy = (line_bbox[1] + line_bbox[3]) / 2.0
+        for table in tables:
+            grid_x = table.get("grid_x", [])
+            grid_y = table.get("grid_y", [])
+            if len(grid_x) < 2 or len(grid_y) < 2:
+                continue
+            for r in range(len(grid_y) - 1):
+                for c in range(len(grid_x) - 1):
+                    cell = (
+                        float(grid_x[c]),
+                        float(grid_y[r]),
+                        float(grid_x[c + 1]),
+                        float(grid_y[r + 1]),
+                    )
+                    if cell[0] - 1.0 <= cx <= cell[2] + 1.0 and cell[1] - 1.0 <= cy <= cell[3] + 1.0:
+                        return cell
+        return None
+
+    @staticmethod
+    def _same_table_cell(a: RectTuple, b: RectTuple, tol: float = 3.0) -> bool:
+        return (
+            abs(a[0] - b[0]) <= tol
+            and abs(a[1] - b[1]) <= tol
+            and abs(a[2] - b[2]) <= tol
+            and abs(a[3] - b[3]) <= tol
+        )
+
+    def _is_short_colon_label_line(self, text: str) -> bool:
+        t = self._normalize_text(text)
+        if not t:
+            return False
+        if not re.search(r":\s*$", t):
+            return False
+        return len(t) <= 80 and self._word_count(t) <= 12
+
+    def _contains_checkbox_glyph(self, text: str) -> bool:
+        if self._is_checkbox_glyph(text):
+            return True
+        glyph_tokens = {"☐", "☑", "☒", "□", "■", "✓", "✔", "", ""}
+        if any(ch in glyph_tokens for ch in text):
+            return True
+        return any(0xF000 <= ord(ch) <= 0xF0FF for ch in text)
+
+    def _can_merge_enum_continuation(
+        self,
+        curr_bbox: RectTuple,
+        curr_line_height: float,
+        curr_cell: RectTuple | None,
+        next_text: str,
+        next_bbox: RectTuple,
+        next_cell: RectTuple | None,
+    ) -> bool:
+        # 规则2：紧邻且同列（最高优先级）
+        gap = float(next_bbox[1]) - float(curr_bbox[3])
+        if gap < -0.25 * curr_line_height or gap > 1.5 * curr_line_height:
+            return False
+        x_close = abs(float(next_bbox[0]) - float(curr_bbox[0])) < 10.0
+        x_overlap = self._line_overlap_ratio(
+            float(curr_bbox[0]), float(curr_bbox[2]),
+            float(next_bbox[0]), float(next_bbox[2]),
+        ) > 0.6
+        if not (x_close or x_overlap):
+            return False
+        if curr_cell is not None or next_cell is not None:
+            if curr_cell is None or next_cell is None:
+                return False
+            if not self._same_table_cell(curr_cell, next_cell):
+                return False
+
+        # 规则3：下一行不能是新标签起点
+        n_text = self._normalize_text(next_text)
+        if not n_text:
+            return False
+        if self.ENUM_PREFIX_RE.match(n_text):
+            return False
+        if self._is_short_colon_label_line(n_text):
+            return False
+        if self._contains_checkbox_glyph(n_text):
+            return False
+        if self._is_section_header(n_text):
+            return False
+
+        return True
+
     def _find_text_left_of(
         self,
         text_spans: List[Dict[str, Any]],
@@ -285,9 +375,22 @@ class LabelFirstMixin:
         page_num: int,
     ) -> List[LabelCandidate]:
         labels: List[LabelCandidate] = []
+        indexed_lines: List[Tuple[int, Dict[str, Any]]] = [
+            (i, tl)
+            for i, tl in enumerate(text_lines)
+            if tl.get("bbox") and self._normalize_text(str(tl.get("text", "")))
+        ]
+        indexed_lines.sort(key=lambda it: (float(it[1]["bbox"][1]), float(it[1]["bbox"][0])))
+        line_cell_map: Dict[int, RectTuple | None] = {
+            i: self._find_table_cell_for_line(tuple(tl["bbox"]), tables)
+            for i, tl in indexed_lines
+        }
+        consumed_follow_lines: set[int] = set()
 
         # 第一轮：全局行首枚举
-        for tl in text_lines:
+        for pos, (line_idx, tl) in enumerate(indexed_lines):
+            if line_idx in consumed_follow_lines:
+                continue
             text = self._normalize_text(str(tl.get("text", "")))
             if not text:
                 continue
@@ -306,10 +409,43 @@ class LabelFirstMixin:
                 content_after_prefix=content_after_prefix,
             ):
                 continue
+            merged_text = text
+            merged_bbox = tuple(tl["bbox"])
+            curr_bbox = merged_bbox
+            curr_line_height = max(1.0, self._bbox_height(curr_bbox))
+            curr_cell = line_cell_map.get(line_idx)
+
+            next_pos = pos + 1
+            while next_pos < len(indexed_lines):
+                next_idx, next_line = indexed_lines[next_pos]
+                if next_idx in consumed_follow_lines:
+                    next_pos += 1
+                    continue
+                next_text = self._normalize_text(str(next_line.get("text", "")))
+                next_bbox = tuple(next_line["bbox"])
+                next_cell = line_cell_map.get(next_idx)
+                if not self._can_merge_enum_continuation(
+                    curr_bbox=curr_bbox,
+                    curr_line_height=curr_line_height,
+                    curr_cell=curr_cell,
+                    next_text=next_text,
+                    next_bbox=next_bbox,
+                    next_cell=next_cell,
+                ):
+                    break
+                merged_text = self._normalize_text(f"{merged_text} {next_text}")
+                merged_bbox = self._bbox_union(merged_bbox, next_bbox)
+                curr_bbox = merged_bbox
+                curr_line_height = max(curr_line_height, self._bbox_height(next_bbox))
+                if curr_cell is None:
+                    curr_cell = next_cell
+                consumed_follow_lines.add(next_idx)
+                next_pos += 1
+
             labels.append(
                 LabelCandidate(
-                    text=text,
-                    bbox=tuple(tl["bbox"]),
+                    text=merged_text,
+                    bbox=merged_bbox,
                     source="enum",
                     confidence=0.65,
                     page_num=page_num,
@@ -617,30 +753,66 @@ class LabelFirstMixin:
             return None
 
         cell_x0, cell_y0, cell_x1, cell_y1 = cell
+        label_y1 = lb.bbox[3]
         label_x1 = lb.bbox[2]
         padding = 2.0
-        right_space = cell_x1 - label_x1
+        right_candidate: RectTuple | None = None
+        below_candidate: RectTuple | None = None
 
-        if right_space > self.MIN_FIELD_WIDTH:
-            return (
-                self._round(label_x1 + padding),
-                self._round(cell_y0 + padding),
-                self._round(cell_x1 - padding),
-                self._round(cell_y1 - padding),
-            )
+        # 候选 A：label 右侧（同单元格）
+        right_rect = (
+            self._round(label_x1 + padding),
+            self._round(cell_y0 + padding),
+            self._round(cell_x1 - padding),
+            self._round(cell_y1 - padding),
+        )
+        if self._bbox_width(right_rect) >= self.MIN_FIELD_WIDTH and self._bbox_height(right_rect) >= self.MIN_FIELD_HEIGHT:
+            right_candidate = right_rect
 
+        # 候选 B：label 下方（同单元格）
+        below_rect = (
+            self._round(cell_x0 + padding),
+            self._round(label_y1 + padding),
+            self._round(cell_x1 - padding),
+            self._round(cell_y1 - padding),
+        )
+        if self._bbox_width(below_rect) >= self.MIN_FIELD_WIDTH and self._bbox_height(below_rect) >= self.MIN_FIELD_HEIGHT:
+            below_candidate = below_rect
+
+        # 同单元格候选优先：右侧/下方都可用时，直接按横向宽度选择更宽者。
+        if right_candidate and below_candidate:
+            same_cell_candidates = [r for r in (right_candidate, below_candidate) if r[2] >= lb.bbox[0]]
+            if same_cell_candidates:
+                return max(same_cell_candidates, key=lambda r: self._bbox_width(r))
+        elif right_candidate and right_candidate[2] >= lb.bbox[0]:
+            return right_candidate
+        elif below_candidate and below_candidate[2] >= lb.bbox[0]:
+            return below_candidate
+
+        # 同单元格不可用时，再尝试邻接空单元格
+        external_candidates: List[RectTuple] = []
         right_cell = self._find_right_empty_cell(cell, tables, text_lines)
         if right_cell is not None:
-            return (
-                self._round(right_cell[0] + padding),
-                self._round(right_cell[1] + padding),
-                self._round(right_cell[2] - padding),
-                self._round(right_cell[3] - padding),
+            external_candidates.append(
+                (
+                    self._round(right_cell[0] + padding),
+                    self._round(right_cell[1] + padding),
+                    self._round(right_cell[2] - padding),
+                    self._round(right_cell[3] - padding),
+                )
             )
 
         below_space = self._find_below_empty_in_table(cell, tables, text_lines)
         if below_space is not None:
-            return below_space
+            external_candidates.append(below_space)
+
+        valid_external = [
+            r for r in external_candidates
+            if self._bbox_width(r) >= self.MIN_FIELD_WIDTH and self._bbox_height(r) >= self.MIN_FIELD_HEIGHT
+            and r[2] >= lb.bbox[0]
+        ]
+        if valid_external:
+            return max(valid_external, key=lambda r: self._bbox_width(r))
 
         return None
 
@@ -804,6 +976,8 @@ class LabelFirstMixin:
             rect_h = rect[3] - rect[1]
             if rect_w < self.MIN_FIELD_WIDTH or rect_h < self.MIN_FIELD_HEIGHT:
                 continue
+            if lb.table_cell_bbox is not None and rect[2] < lb.bbox[0]:
+                continue
 
             fields.append(
                 {
@@ -850,7 +1024,8 @@ class LabelFirstMixin:
                 curr_rect = list(fields[curr_idx]["fill_rect"])
                 next_label_x0 = float(fields[next_idx]["label_bbox"][0])
 
-                if curr_rect[2] > next_label_x0 - 2.0:
+                own_label_x0 = float(fields[curr_idx]["label_bbox"][0])
+                if next_label_x0 > own_label_x0 + 1.0 and curr_rect[2] > next_label_x0 - 2.0:
                     curr_rect[2] = next_label_x0 - 2.0
                 if curr_rect[2] - curr_rect[0] < self.MIN_FIELD_WIDTH:
                     fields[curr_idx]["_discard"] = True
