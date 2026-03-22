@@ -50,7 +50,9 @@ class PDFPipelineDispatcher:
         pdf_type = self.classifier.classify(pdf_path)
         if pdf_type == "fillable":
             return pdf_type, self.fillable_pipeline
-        return pdf_type, self.native_pipeline
+        if pdf_type == "native":
+            return pdf_type, self.native_pipeline
+        raise NotImplementedError("pdf分类有问题：当前暂不支持 scanned 类型 PDF")
 
     def extract_fields(self, pdf_path: Path) -> Tuple[list[str], list[FieldInfo]]:
         _, pipeline = self._select_pipeline(pdf_path)

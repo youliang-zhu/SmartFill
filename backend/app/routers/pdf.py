@@ -21,7 +21,6 @@ from app.utils.validators import (
     validate_pdf_header,
     validate_file_exists,
 )
-from app.services.pdf_classifier import get_pdf_classifier
 from app.services.pdf_pipeline_dispatcher import get_pdf_pipeline_dispatcher
 
 router = APIRouter(tags=["PDF"])
@@ -79,37 +78,6 @@ async def upload_pdf(file: UploadFile = File(...)):
             detail=f"保存文件失败: {str(e)}"
         )
 
-    # 上传阶段类型校验：当前仅允许 fillable(AcroForm)
-    pdf_path = storage.get_path(file_id)
-    if pdf_path is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="保存文件后无法读取，请稍后重试"
-        )
-
-    classifier = get_pdf_classifier()
-    try:
-        pdf_type = classifier.classify(pdf_path)
-    except PermissionError:
-        storage.delete(file_id)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="PDF 文件被密码保护，无法读取"
-        )
-    except ValueError:
-        storage.delete(file_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="无法识别 PDF 类型，请确认这是一个标准 PDF"
-        )
-
-    if pdf_type != "fillable":
-        storage.delete(file_id)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"暂不支持 {pdf_type} 类型 PDF，请上传 AcroForm 可编辑 PDF"
-        )
-    
     return UploadResponse(
         file_id=file_id,
         filename=file.filename,

@@ -1,5 +1,11 @@
 # SmartFill v2 开发计划 — Native PDF 智能填写
 
+> 文档定位：v2 整体架构与大方向规划主文档。  
+> 记录范围：只记录架构目标、模块边界、阶段路线与关键架构变更。  
+> 排除范围：不记录具体 debug 过程、错误日志或临时排障细节。  
+> 更新规则：当 v2 大方向或架构发生变化时，统一追加到本文件。  
+> 边界说明：`dev_v1` 相关文档与实现保持不动，仅作为历史基线。  
+
 > 版本：v2.0
 > 创建时间：2026-03-13
 > 状态：规划中
@@ -270,8 +276,6 @@ else:
 - Instafill.ai 的 `detect_boxes_fitz()`: 从 PyMuPDF 矢量数据定位表格框、下划线、边框，准确率 95-98%
 - pdfplumber: 用 `.lines` + `.rects` + `.chars` 做表格检测，需要自己写网格推断逻辑
 - Adobe Acrobat: 找下划线/矩形框 → 转为 text field，相邻文字作为 field name
-
-**测试 PDF**：TestSpace/Native.pdf + 2 个额外收集的英文政府表单
 
 ---
 
