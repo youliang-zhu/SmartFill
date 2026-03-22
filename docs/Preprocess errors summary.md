@@ -1542,3 +1542,251 @@ if label_text is None:
 - 004 中“冒号/分项字段无填充框”的主问题已完成修复并落盘。
 - 008 中“跨字段重叠”已加入硬阻断，当前验证通过。
 - 本轮按你的策略执行：`B-013` 继续不做，仅保留 `B-012`。
+
+---
+
+## 17. Preprocess v2 重构后首次审查（2026-03-22）
+
+### 17.0 概述
+
+v2 基于 "Label-first" 架构完成重构，代码位于 `backend/app/services/native/preprocess/`，测试位于 `TestSpace/preprocess_test_v2/`。
+
+6份测试 PDF 全部通过 constraint 硬性检查（no_fill_rect=0, rect_overlap=0, rect_left_of_label=0, rect_exceeds_page=0），Gate3/Gate5 也全部 PASS。018 page 1 从 v1 的 78 字段降至 34 字段，表明 label-first + dedup 架构有效解决了 v1 的核心重复问题。
+
+**测试总结：**
+
+| PDF | Pages | Total Fields | Hard Constraints | duplicate_label (warn) |
+|-----|-------|-------------|-----------------|----------------------|
+| 001 | 16 | 167 | PASS | 18 |
+| 004 | 11 | 88 | PASS | 17 |
+| 008 | 5 | 94 | PASS | 31 |
+| 013 | 3 | 39 | PASS | 4 |
+| 018 | 4 | 91 | PASS | 0 |
+| 019 | 1 | 12 | PASS | 0 |
+
+Phase3 dedup 效果显著：018 page 1 从 107 raw → 42 unique（去除 65 重复）。所有页面 residual_dup=0。
+
+---
+
+### 17.1 BUG-V2-001: Underline 收集器误收超链接/强调下划线
+
+**严重程度：中**
+
+**现象：** 004 page 10 有 3 个 underline labels，全部是 URL 文本或被强调的文本，而非表单字段：
+
+```
+src=underline     text='http://www.foreignlaborcert.doleta.gov/adverse.cfm...'
+src=underline     text='Hourly Rate Equivalent'
+src=underline     text='http://www.dol.gov/opa/media/press/eta/ETA20111794fs.pdf .'
+```
+
+这些文本下方的水平线是超链接下划线或强调线，不是表单填写区的下划线。Phase 4 正确地未能为它们分配 fill_rect（最终 0 个 field），但它们不应进入 Phase 2 的 label 收集。
+
+**根因：** `_collect_underline_labels` 仅过滤了 table border 线和长度 < 40 的短线，但没有过滤：
+1. 文本内容为 URL 的情况（以 `http://` 或 `www.` 开头）
+2. 下划线恰好在文本正下方且完全覆盖文本宽度的情况（这是强调线/超链接线，不是填写区下划线）
+
+**建议修复：**
+
+```python
+# 在 _collect_underline_labels 中增加 URL 过滤
+if re.match(r'^https?://', text) or re.match(r'^www\.', text):
+    continue
+
+# 增加"下划线完全覆盖文本"检测（强调线判定）
+# 如果下划线起点在文本左边界附近，且终点在文本右边界附近，说明是文字强调线
+label_bbox = best_label["bbox"]
+label_x0, label_x1 = label_bbox[0], label_bbox[2]
+underline_coverage = (min(x1, label_x1) - max(x0, label_x0)) / max(1.0, label_x1 - label_x0)
+if underline_coverage > 0.85 and x0 <= label_x0 + 5.0:
+    continue  # 下划线几乎完全覆盖文本 → 是强调线，跳过
+```
+
+---
+
+### 17.2 BUG-V2-002: "underline_field" 回退标签产生大量无意义重复
+
+**严重程度：中**
+
+**现象：** 当 underline 收集器找不到下划线左侧的文本时，回退到上方文本或默认标签 "underline_field"。在有多个独立下划线的页面中产生大量同名字段：
+
+```
+001 Page 9:  5 个 "underline_field"
+001 Page 10: 8 个 "underline_field"
+004 Page 4:  2 个 "underline_field"
+013 Page 1:  4 个 "underline_field"
+```
+
+这些字段虽然 fill_rect 各不相同，但标签完全一致，对 VLM 阶段和最终用户都没有区分价值。
+
+**根因：** `_collect_underline_labels` 第 119 行的 fallback 逻辑：
+```python
+label_text = ... if above_label else "underline_field"
+```
+
+**建议修复：** 用位置信息生成唯一标签：
+```python
+label_text = f"field_line_{int(y)}"  # 或 f"p{page_num}_line_{idx}"
+```
+或者，使用上方文本 + 行号组合来生成更有意义的标签。
+
+**需要确认：** 这个问题对 VLM 阶段的影响有多大？如果 VLM 主要依赖 fill_rect 位置而非 label 文本，则优先级可降低。
+
+---
+
+### 17.3 BUG-V2-003: 节标题被 enum 收集器误检为字段标签
+
+**严重程度：中**
+
+**现象：** 018 page 1 的检测结果中包含明显的节标题：
+
+```
+p1_f001  enum  conf=0.65  label='U.S. Department of Labor'
+p1_f003  enum  conf=0.65  label='A. Employment-Based Visa Information'
+```
+
+"U.S. Department of Labor" 不是表单字段。"A. Employment-Based Visa Information" 是节标题，不是可填写字段。
+
+**根因：** `_collect_enum_labels` 检测以 `A.`、`1.` 等编号开头的文本行，但没有对节标题做特殊过滤。v1 中有 `_is_section_header` 检查和 `SECTION_HEADER_PENALTY`，但 v2 的 enum 收集器没有应用它。
+
+**建议修复：**
+
+```python
+# 在 _collect_enum_labels 第一轮循环中增加
+if self._is_section_header(content_after_prefix):
+    continue
+# 或者用更宽泛的规则：如果去掉编号前缀后剩余文本全大写且 ≤4 词，跳过
+```
+
+但需要注意：某些表单中编号项确实是字段（如 "1. Name"），需要区分"节标题"和"带编号的字段标签"。
+
+**需要确认：** 对于 v2，是否希望在 Phase 2 就过滤节标题，还是交给 VLM 过滤？如果交给 VLM，则此项可标记为低优先级。
+
+---
+
+### 17.4 BUG-V2-004: Unicode PUA 字符被当作表格标签收集
+
+**严重程度：低**
+
+**现象：** 004 page 4 有多个 `\uf071` 标签（Unicode 私有区字符，通常是 checkbox 图标字体）：
+
+```
+table  conf=0.66  label='\uf071'
+table  conf=0.66  label='\uf071'
+underline  conf=0.5  label='\uf071'
+```
+
+**根因：** `_collect_table_labels` 调用了 `_is_instructional_text` 和长度过滤，但没有检查 `_is_checkbox_glyph`。包含 PUA 字符的文本通常是 checkbox 图标或装饰符号。
+
+**建议修复：**
+
+```python
+# 在 _collect_table_labels 和 _collect_underline_labels 中增加
+if self._is_checkbox_glyph(combined_text):
+    continue
+```
+
+同时应在 `_is_checkbox_glyph` 方法中扩展 PUA 范围检查，确保 `\uf071` 等字符被覆盖。目前的 `0xF000 <= ord(ch) <= 0xF0FF` 应该已经覆盖了 `\uf071`，但 `_collect_table_labels` 没有调用此方法。
+
+---
+
+### 17.5 BUG-V2-005: "$ $" 等占位符文本被当作表格标签
+
+**严重程度：低**
+
+**现象：** 004 page 4 有多个仅包含 `$ $` 的表格标签：
+
+```
+table  conf=0.66  label='$ $'
+table  conf=0.66  label='$ $'
+table  conf=0.66  label='$ $'
+```
+
+这些是金额栏的格式占位符（类似于 `$____`），不是有意义的字段标签。
+
+**根因：** `_collect_table_labels` 没有过滤纯符号/短占位符文本。
+
+**建议修复：**
+
+```python
+# 增加有效内容检测
+alpha_count = sum(1 for ch in combined_text if ch.isalpha())
+if alpha_count < 2:
+    continue  # 纯符号或单字母不是有意义的标签
+```
+
+---
+
+### 17.6 BUG-V2-006: "NO" 被检测为 underline 字段标签
+
+**严重程度：低**
+
+**现象：** 008 page 1 中 "NO" 出现两次作为 underline 标签：
+
+```
+underline  conf=0.74  label='NO'
+underline  conf=0.74  label='NO'
+```
+
+这是 YES/NO checkbox 选项文本，位于 checkbox 旁边，恰好其右侧有一条下划线。
+
+**根因：** v1 对 YES/NO 文本有 `YES_NO_LABEL_PENALTY = 150.0` 的惩罚分数，会降低匹配优先级。但 v2 的 `_collect_underline_labels` 使用 `_find_text_left_of` 直接找最近的左侧文本，没有 YES/NO 惩罚机制。
+
+**建议修复：**
+
+```python
+# 在 _collect_underline_labels 中增加 YES/NO 过滤
+if re.match(r'^(YES|NO|Yes|No|yes|no)$', text.strip()):
+    continue
+```
+
+或者将 confidence 大幅降低，让其在 dedup 阶段被同位置的 checkbox 覆盖。
+
+---
+
+### 17.7 DESIGN-V2-001: v2 未使用 engine1_box（显式矩形框）作为 fill_rect 来源
+
+**严重程度：待评估**
+
+**现象：** v1 的 engine1_box 检测 PDF 中显式绘制的矩形框（如输入框、文本框），直接将矩形作为 fill_rect，是最高置信度来源（0.84）。v2 的 label-first 流程不检测显式矩形，仅通过 `_find_right_blank` / `_find_below_blank` 从空白空间推断 fill_rect。
+
+**影响分析：** 从当前 6 份测试 PDF 的结果看，v2 通过 underline / table / blank space 检测，仍然能覆盖大部分字段。但对于使用大面积矩形框作为输入区域的 PDF（非表格场景），v2 的 fill_rect 精度可能不如 v1。
+
+**当前状态：** 所有 6 份 PDF 的 constraint 检查全部 PASS。未观察到明显的字段遗漏。但测试集较小，不能排除在其他 PDF 上出现问题。
+
+**需要确认：** 是否要在 Phase 4 中增加"检测显式矩形框"作为额外的 fill_rect 候选来源？实现方式可以是：
+- 在 `_assign_fill_rects` 中，如果 `_find_right_blank` 和 `_find_below_blank` 都失败，尝试查找 label 附近的显式矩形绘图
+- 或者新增一个 `_find_rect_box` 方法，在 drawing_data 中查找匹配的矩形
+
+---
+
+### 17.8 WARN-V2-001: 008 duplicate_label 警告数量高（31个）
+
+**严重程度：信息/预期行为**
+
+**现象：** 008 (AO-78 求职表) 有 31 个 duplicate_label 警告，主要来源：
+- Page 3 和 Page 4 是完全相同的"就业历史"重复页面，所有字段标签天然重复（"from:", "to:", "city", "state", "per" 等）
+- "underline_field" 回退标签重复
+
+**结论：** 跨页面的相同标签名不应视为问题 — 这是设计如此的重复表格页。可以考虑将 duplicate_label 检查改为仅检查同一页面内的重复，或标注哪些重复来自同页 vs 跨页。
+
+---
+
+### 17.9 总结与优先级
+
+| 编号 | 问题 | 严重程度 | 建议 |
+|------|------|---------|------|
+| V2-001 | URL/强调线被误收为 underline 标签 | 中 | 增加 URL 过滤 + 强调线检测 |
+| V2-002 | "underline_field" 回退标签重复 | 中 | 用位置信息生成唯一标签 |
+| V2-003 | 节标题被 enum 误检 | 中 | 增加 section_header 过滤（或交给 VLM） |
+| V2-004 | PUA 字符被当作标签 | 低 | 增加 checkbox_glyph 检查 |
+| V2-005 | "$ $" 占位符被当作标签 | 低 | 增加最少字母数过滤 |
+| V2-006 | YES/NO 被检测为 underline 标签 | 低 | 增加 YES/NO 过滤 |
+| V2-007 | 无 engine1_box fill_rect 来源 | 待评估 | 需确认是否需要补充 |
+| V2-008 | 008 duplicate_label 高 | 信息 | 预期行为，可优化检查逻辑 |
+
+**需要你确认的问题：**
+
+1. **V2-003（节标题误检）**：在 Phase 2 阶段过滤节标题，还是交给 VLM 阶段处理？
+2. **V2-007（缺少 engine1_box）**：是否需要在 Phase 4 中补充显式矩形框检测？当前测试集全部通过，但覆盖面不够广。
+3. **V2-002（underline_field 回退标签）**：VLM 阶段是否依赖 label 文本？如果 VLM 主要看 fill_rect 位置，此问题优先级可以降低。

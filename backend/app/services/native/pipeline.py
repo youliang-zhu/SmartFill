@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from app.models.schemas import FieldInfo, FillResult
-from app.services.native.detector import get_native_detector
+from app.services.native.preprocess.detector import get_native_detector
 
 
 class NativePipeline:
