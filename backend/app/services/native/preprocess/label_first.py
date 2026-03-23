@@ -258,10 +258,9 @@ class LabelFirstMixin:
         text_lines: List[Dict[str, Any]],
         page_num: int,
     ) -> List[LabelCandidate]:
-        del text_lines
         labels: List[LabelCandidate] = []
-        for sp in text_spans:
-            text = self._normalize_text(str(sp.get("text", "")))
+        for ln in text_lines:
+            text = self._normalize_text(str(ln.get("text", "")))
             if not text:
                 continue
             if not re.search(r":\s*$", text):
@@ -275,7 +274,7 @@ class LabelFirstMixin:
             labels.append(
                 LabelCandidate(
                     text=text,
-                    bbox=tuple(sp["bbox"]),
+                    bbox=tuple(ln["bbox"]),
                     source="colon",
                     confidence=0.70,
                     page_num=page_num,

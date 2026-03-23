@@ -20,7 +20,7 @@ class UtilityMixin:
     MIN_FIELD_HEIGHT = 6.0
 
     # 规则阈值
-    MAX_LABEL_LEN = 160
+    MAX_LABEL_LEN = 250
     MAX_LABEL_WORDS = 28
     ENGINE2_TRIGGER_THRESHOLD = 3
     LABEL_AREA_RATIO = 0.3
