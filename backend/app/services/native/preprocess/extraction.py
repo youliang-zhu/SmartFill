@@ -45,6 +45,8 @@ class ExtractionMixin:
                 texts = []
                 bbox: RectTuple | None = None
                 font_sizes: list[float] = []
+                char_y_tops: list[float] = []
+                char_y_bottoms: list[float] = []
                 for span in line_spans:
                     t = self._normalize_text(span.get("text", ""))
                     if not t:
@@ -53,6 +55,12 @@ class ExtractionMixin:
                     sb = self._rect_tuple(fitz.Rect(span.get("bbox")))
                     bbox = sb if bbox is None else self._bbox_union(bbox, sb)
                     font_sizes.append(float(span.get("size", 0.0)))
+                    char_y_tops.append(float(sb[1]))
+                    origin = span.get("origin")
+                    if origin is not None:
+                        char_y_bottoms.append(float(origin[1]))
+                    else:
+                        char_y_bottoms.append(float(sb[3]))
                 if not texts or bbox is None:
                     continue
                 avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 0.0
@@ -62,6 +70,8 @@ class ExtractionMixin:
                         "bbox": bbox,
                         "font_size": self._round(avg_font_size),
                         "page_num": page_num,
+                        "char_y_top": min(char_y_tops),
+                        "char_y_bottom": max(char_y_bottoms),
                     }
                 )
         return lines_out
@@ -69,24 +79,51 @@ class ExtractionMixin:
     def _merge_continuation_lines(
         self,
         text_lines: List[Dict[str, Any]],
-        gap_ratio: float = 0.8,
+        drawing_data: Dict[str, Any] | None = None,
+        gap_ratio: float = 0.1,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """纯距离双向合并续行。
+        """Union-Find pairwise 合并续行。
 
-        规则：
-        - 相邻行垂直间距 < 两行字体高度均值 × gap_ratio → 合并
-        - 含 checkbox 字符的行不参与合并
-        - 返回 (merged_lines, merge_log)
-          merge_log 每条记录：{from_texts, merged_text, gap, avg_font_size, gap_pct}
+        对每对行 (i, j) 判断：
+        1. 垂直间距（两行 y 边界的最小间距）< 两行字体大小均值 × gap_ratio
+        2. x 轴中心点在对方 x 范围内（任一方向满足即可）
+        3. 两行都不含 checkbox 字符
+        4. 两行之间不存在跨越双方 x 范围的矢量水平边界线
+
+        满足则建边，最终按 Union-Find 连通分量合并。
+        返回 (merged_lines, merge_log)。
         """
         if not text_lines:
             return [], []
 
-        # 按 (y, x) 排序
-        sorted_lines = sorted(
-            text_lines,
-            key=lambda ln: (float(ln["bbox"][1]), float(ln["bbox"][0])),
-        )
+        n = len(text_lines)
+        h_lines: List[Dict[str, float]] = (drawing_data or {}).get("horizontal_lines", [])
+
+        # 构建填充色块查找结构（逆绘制顺序 = 最顶层优先）
+        _WHITE = (1.0, 1.0, 1.0)
+        _fill_rects: List[tuple] = []  # (x0, y0, x1, y1, (r,g,b))
+        for _d in reversed((drawing_data or {}).get("drawings", [])):
+            _fill = _d.get("fill")
+            if _fill is None:
+                continue
+            if not (isinstance(_fill, (list, tuple)) and len(_fill) >= 3):
+                continue
+            _r = _d.get("rect")
+            if _r is None:
+                continue
+            _fill_rects.append((
+                float(_r[0]), float(_r[1]), float(_r[2]), float(_r[3]),
+                (float(_fill[0]), float(_fill[1]), float(_fill[2])),
+            ))
+
+        def _get_bg_color(bbox: tuple) -> tuple:
+            """返回覆盖 bbox 中心点的最顶层填充色，无填充则返回白色。"""
+            cx = (float(bbox[0]) + float(bbox[2])) / 2.0
+            cy = (float(bbox[1]) + float(bbox[3])) / 2.0
+            for rx0, ry0, rx1, ry1, color in _fill_rects:
+                if rx0 <= cx <= rx1 and ry0 <= cy <= ry1:
+                    return color
+            return _WHITE
 
         checkbox_tokens = {"☐", "☑", "☒", "□", "■", "✓", "✔", "\uf06f", "\uf0fe"}
 
@@ -95,75 +132,139 @@ class ExtractionMixin:
                 return True
             return any(0xF000 <= ord(ch) <= 0xF0FF for ch in text)
 
-        merged: List[Dict[str, Any]] = []
-        merge_log: List[Dict[str, Any]] = []
+        def _has_border_between(above_line: Dict[str, Any], below_line: Dict[str, Any]) -> bool:
+            """检查两行之间是否有水平矢量边界线。
+            以上方行的字体基线（char_y_bottom）为上边界，
+            下方行的字体顶部（char_y_top）为下边界，
+            避免 bbox padding 导致的漏检。
+            """
+            above_bbox = above_line["bbox"]
+            below_bbox = below_line["bbox"]
+            y_top = float(above_line.get("char_y_bottom", above_bbox[3]))
+            y_bot = float(below_line.get("char_y_top", below_bbox[1]))
+            if y_top >= y_bot:
+                return False
+            x_left = min(float(above_bbox[0]), float(below_bbox[0]))
+            x_right = max(float(above_bbox[2]), float(below_bbox[2]))
+            for hl in h_lines:
+                hy = float(hl.get("y", 0.0))
+                if y_top <= hy <= y_bot:
+                    hx0 = float(hl.get("x0", 0.0))
+                    hx1 = float(hl.get("x1", 0.0))
+                    if hx0 <= x_right and hx1 >= x_left:
+                        return True
+            return False
 
-        i = 0
-        while i < len(sorted_lines):
-            curr = sorted_lines[i]
-            curr_text = curr["text"]
+        # 预计算
+        bboxes = [ln["bbox"] for ln in text_lines]
+        font_sizes = [float(ln.get("font_size", 0.0)) for ln in text_lines]
+        is_cb = [_has_checkbox(ln["text"]) for ln in text_lines]
 
-            # checkbox 行不合并，直接保留
-            if _has_checkbox(curr_text):
-                merged.append(dict(curr))
-                i += 1
+        # Union-Find
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # 记录每对合并的 gap 信息
+        edge_gaps: List[Dict[str, Any]] = []
+
+        # pairwise 扫描
+        for i in range(n):
+            if is_cb[i]:
                 continue
+            bi = bboxes[i]
+            i_x0, i_y0, i_x1, i_y1 = float(bi[0]), float(bi[1]), float(bi[2]), float(bi[3])
+            i_cx = (i_x0 + i_x1) / 2.0
+            fs_i = font_sizes[i]
 
-            group_texts = [curr_text]
-            group_bbox = curr["bbox"]
-            group_font_size = float(curr.get("font_size", 0.0))
-            group_gaps: list[dict] = []
+            for j in range(i + 1, n):
+                if is_cb[j]:
+                    continue
+                bj = bboxes[j]
+                j_x0, j_y0, j_x1, j_y1 = float(bj[0]), float(bj[1]), float(bj[2]), float(bj[3])
 
-            j = i + 1
-            while j < len(sorted_lines):
-                nxt = sorted_lines[j]
-                nxt_text = nxt["text"]
-
-                if _has_checkbox(nxt_text):
-                    break
-
-                nxt_bbox = nxt["bbox"]
-                nxt_font_size = float(nxt.get("font_size", 0.0))
-
-                # 垂直间距 = 下一行顶部 - 当前组底部
-                gap = float(nxt_bbox[1]) - float(group_bbox[3])
-                avg_fs = (group_font_size + nxt_font_size) / 2.0
+                # 垂直间距：取两行 y 区间的非重叠部分（重叠时为 0）
+                gap = max(0.0, max(j_y0 - i_y1, i_y0 - j_y1))
+                avg_fs = (fs_i + font_sizes[j]) / 2.0
                 if avg_fs <= 0:
-                    break
+                    continue
+                if gap >= avg_fs * gap_ratio:
+                    continue
 
-                threshold = avg_fs * gap_ratio
-                if gap < 0 or gap >= threshold:
-                    break
+                # x 轴中心点在对方 x 范围内（任一方向）
+                j_cx = (j_x0 + j_x1) / 2.0
+                cx_i_in_j = j_x0 <= i_cx <= j_x1
+                cx_j_in_i = i_x0 <= j_cx <= i_x1
+                if not (cx_i_in_j or cx_j_in_i):
+                    continue
 
-                # 合并
-                gap_pct = (gap / avg_fs) * 100.0 if avg_fs > 0 else 0.0
-                group_gaps.append({
+                # 矢量边界检查：两行之间有水平边界线则拒绝合并
+                above_line = text_lines[i] if i_y0 <= j_y0 else text_lines[j]
+                below_line = text_lines[j] if i_y0 <= j_y0 else text_lines[i]
+                if _has_border_between(above_line, below_line):
+                    continue
+
+                # 背景色检查：两行背景色不同则拒绝合并（处于不同表格单元格）
+                if _get_bg_color(bi) != _get_bg_color(bj):
+                    continue
+
+                # 建边
+                union(i, j)
+                gap_pct = (gap / avg_fs) * 100.0
+                edge_gaps.append({
+                    "i": i, "j": j,
                     "gap": round(gap, 2),
                     "avg_font_size": round(avg_fs, 2),
                     "gap_pct": round(gap_pct, 1),
                 })
-                group_texts.append(nxt_text)
-                group_bbox = self._bbox_union(group_bbox, nxt_bbox)
-                group_font_size = avg_fs
-                j += 1
 
-            merged_text = self._normalize_text(" ".join(group_texts))
+        # 按连通分量分组
+        groups: Dict[int, List[int]] = {}
+        for i in range(n):
+            root = find(i)
+            groups.setdefault(root, []).append(i)
+
+        merged: List[Dict[str, Any]] = []
+        merge_log: List[Dict[str, Any]] = []
+
+        for members in sorted(groups.values(), key=lambda m: min(m)):
+            # 组内按 y 排序
+            members.sort(key=lambda idx: (float(bboxes[idx][1]), float(bboxes[idx][0])))
+            texts = [text_lines[idx]["text"] for idx in members]
+            bbox = bboxes[members[0]]
+            for idx in members[1:]:
+                bbox = self._bbox_union(bbox, bboxes[idx])
+            avg_fs = sum(font_sizes[idx] for idx in members) / len(members)
+            merged_text = self._normalize_text(" ".join(texts))
             merged.append({
                 "text": merged_text,
-                "bbox": group_bbox,
-                "font_size": round(group_font_size, 2),
-                "page_num": curr.get("page_num", 0),
+                "bbox": bbox,
+                "font_size": round(avg_fs, 2),
+                "page_num": text_lines[members[0]].get("page_num", 0),
             })
 
-            if len(group_texts) > 1:
+            if len(members) > 1:
+                # 收集组内 edge gap 信息
+                member_set = set(members)
+                group_gaps = [
+                    eg for eg in edge_gaps
+                    if eg["i"] in member_set and eg["j"] in member_set
+                ]
                 merge_log.append({
-                    "from_texts": group_texts,
+                    "from_texts": texts,
                     "merged_text": merged_text,
-                    "line_count": len(group_texts),
+                    "line_count": len(members),
                     "gaps": group_gaps,
                 })
-
-            i = j
 
         return merged, merge_log
 

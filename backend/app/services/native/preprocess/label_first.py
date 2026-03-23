@@ -109,47 +109,6 @@ class LabelFirstMixin:
             return True
         return any(0xF000 <= ord(ch) <= 0xF0FF for ch in text)
 
-    def _can_merge_enum_continuation(
-        self,
-        curr_bbox: RectTuple,
-        curr_line_height: float,
-        curr_cell: RectTuple | None,
-        next_text: str,
-        next_bbox: RectTuple,
-        next_cell: RectTuple | None,
-    ) -> bool:
-        # 规则2：紧邻且同列（最高优先级）
-        gap = float(next_bbox[1]) - float(curr_bbox[3])
-        if gap < -0.25 * curr_line_height or gap > 1.5 * curr_line_height:
-            return False
-        x_close = abs(float(next_bbox[0]) - float(curr_bbox[0])) < 10.0
-        x_overlap = self._line_overlap_ratio(
-            float(curr_bbox[0]), float(curr_bbox[2]),
-            float(next_bbox[0]), float(next_bbox[2]),
-        ) > 0.6
-        if not (x_close or x_overlap):
-            return False
-        if curr_cell is not None or next_cell is not None:
-            if curr_cell is None or next_cell is None:
-                return False
-            if not self._same_table_cell(curr_cell, next_cell):
-                return False
-
-        # 规则3：下一行不能是新标签起点
-        n_text = self._normalize_text(next_text)
-        if not n_text:
-            return False
-        if self.ENUM_PREFIX_RE.match(n_text):
-            return False
-        if self._is_short_colon_label_line(n_text):
-            return False
-        if self._contains_checkbox_glyph(n_text):
-            return False
-        if self._is_section_header(n_text):
-            return False
-
-        return True
-
     def _find_text_left_of(
         self,
         text_spans: List[Dict[str, Any]],
@@ -375,21 +334,10 @@ class LabelFirstMixin:
         page_num: int,
     ) -> List[LabelCandidate]:
         labels: List[LabelCandidate] = []
-        indexed_lines: List[Tuple[int, Dict[str, Any]]] = [
-            (i, tl)
-            for i, tl in enumerate(text_lines)
-            if tl.get("bbox") and self._normalize_text(str(tl.get("text", "")))
-        ]
-        indexed_lines.sort(key=lambda it: (float(it[1]["bbox"][1]), float(it[1]["bbox"][0])))
-        line_cell_map: Dict[int, RectTuple | None] = {
-            i: self._find_table_cell_for_line(tuple(tl["bbox"]), tables)
-            for i, tl in indexed_lines
-        }
-        consumed_follow_lines: set[int] = set()
 
-        # 第一轮：全局行首枚举
-        for pos, (line_idx, tl) in enumerate(indexed_lines):
-            if line_idx in consumed_follow_lines:
+        # 第一轮：全局行首枚举（不再做续行合并，续行由 Phase 1 _merge_continuation_lines 统一处理）
+        for tl in text_lines:
+            if not tl.get("bbox"):
                 continue
             text = self._normalize_text(str(tl.get("text", "")))
             if not text:
@@ -409,43 +357,11 @@ class LabelFirstMixin:
                 content_after_prefix=content_after_prefix,
             ):
                 continue
-            merged_text = text
-            merged_bbox = tuple(tl["bbox"])
-            curr_bbox = merged_bbox
-            curr_line_height = max(1.0, self._bbox_height(curr_bbox))
-            curr_cell = line_cell_map.get(line_idx)
-
-            next_pos = pos + 1
-            while next_pos < len(indexed_lines):
-                next_idx, next_line = indexed_lines[next_pos]
-                if next_idx in consumed_follow_lines:
-                    next_pos += 1
-                    continue
-                next_text = self._normalize_text(str(next_line.get("text", "")))
-                next_bbox = tuple(next_line["bbox"])
-                next_cell = line_cell_map.get(next_idx)
-                if not self._can_merge_enum_continuation(
-                    curr_bbox=curr_bbox,
-                    curr_line_height=curr_line_height,
-                    curr_cell=curr_cell,
-                    next_text=next_text,
-                    next_bbox=next_bbox,
-                    next_cell=next_cell,
-                ):
-                    break
-                merged_text = self._normalize_text(f"{merged_text} {next_text}")
-                merged_bbox = self._bbox_union(merged_bbox, next_bbox)
-                curr_bbox = merged_bbox
-                curr_line_height = max(curr_line_height, self._bbox_height(next_bbox))
-                if curr_cell is None:
-                    curr_cell = next_cell
-                consumed_follow_lines.add(next_idx)
-                next_pos += 1
 
             labels.append(
                 LabelCandidate(
-                    text=merged_text,
-                    bbox=merged_bbox,
+                    text=text,
+                    bbox=tuple(tl["bbox"]),
                     source="enum",
                     confidence=0.65,
                     page_num=page_num,
@@ -1131,22 +1047,25 @@ class LabelFirstMixin:
         tables = self._build_table_grids(drawing_data, page_num)
         page_rect = self._rect_tuple(page.rect)
 
+        # Phase 1.5：续行合并（Union-Find pairwise，含矢量边界检查）
+        merged_lines, _ = self._merge_continuation_lines(text_lines, drawing_data=drawing_data)
+
         all_labels: List[LabelCandidate] = []
         all_labels.extend(
             self._collect_underline_labels(
-                text_lines=text_lines,
+                text_lines=merged_lines,
                 text_spans=text_spans,
                 drawing_data=drawing_data,
                 tables=tables,
                 page_num=page_num,
             )
         )
-        all_labels.extend(self._collect_colon_labels(text_spans=text_spans, text_lines=text_lines, page_num=page_num))
-        all_labels.extend(self._collect_enum_labels(text_lines=text_lines, tables=tables, page_num=page_num))
-        all_labels.extend(self._collect_table_labels(text_lines=text_lines, tables=tables, page_num=page_num))
+        all_labels.extend(self._collect_colon_labels(text_spans=text_spans, text_lines=merged_lines, page_num=page_num))
+        all_labels.extend(self._collect_enum_labels(text_lines=merged_lines, tables=tables, page_num=page_num))
+        all_labels.extend(self._collect_table_labels(text_lines=merged_lines, tables=tables, page_num=page_num))
 
         underline_count = sum(1 for lb in all_labels if lb.source == "underline")
-        is_toc = self._is_toc_page(text_lines, page_width=self._bbox_width(page_rect))
+        is_toc = self._is_toc_page(merged_lines, page_width=self._bbox_width(page_rect))
         if underline_count <= 2 and not is_toc:
             all_labels.extend(
                 self._collect_dotleader_labels(
@@ -1154,7 +1073,7 @@ class LabelFirstMixin:
                     page_num=page_num,
                     page_rect=page_rect,
                     existing_labels=all_labels,
-                    text_lines=text_lines,
+                    text_lines=merged_lines,
                 )
             )
 
@@ -1163,7 +1082,7 @@ class LabelFirstMixin:
             labels=unique_labels,
             drawing_data=drawing_data,
             tables=tables,
-            text_lines=text_lines,
+            text_lines=merged_lines,
             text_spans=text_spans,
             page_rect=page_rect,
         )
@@ -1171,7 +1090,7 @@ class LabelFirstMixin:
             page=page,
             page_num=page_num,
             text_spans=text_spans,
-            text_lines=text_lines,
+            text_lines=merged_lines,
             drawing_data=drawing_data,
         )
         all_fields = self._postprocess(text_fields, checkbox_fields, page_rect)
@@ -1179,7 +1098,7 @@ class LabelFirstMixin:
             "page_num": page_num,
             "page_size": page_rect,
             "text_spans": text_spans,
-            "text_lines": text_lines,
+            "text_lines": merged_lines,
             "table_structures": tables,
             "detected_fields": all_fields,
         }
