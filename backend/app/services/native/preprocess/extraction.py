@@ -44,6 +44,7 @@ class ExtractionMixin:
                     continue
                 texts = []
                 bbox: RectTuple | None = None
+                font_sizes: list[float] = []
                 for span in line_spans:
                     t = self._normalize_text(span.get("text", ""))
                     if not t:
@@ -51,16 +52,120 @@ class ExtractionMixin:
                     texts.append(t)
                     sb = self._rect_tuple(fitz.Rect(span.get("bbox")))
                     bbox = sb if bbox is None else self._bbox_union(bbox, sb)
+                    font_sizes.append(float(span.get("size", 0.0)))
                 if not texts or bbox is None:
                     continue
+                avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 0.0
                 lines_out.append(
                     {
                         "text": self._normalize_text(" ".join(texts)),
                         "bbox": bbox,
+                        "font_size": self._round(avg_font_size),
                         "page_num": page_num,
                     }
                 )
         return lines_out
+
+    def _merge_continuation_lines(
+        self,
+        text_lines: List[Dict[str, Any]],
+        gap_ratio: float = 0.8,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """纯距离双向合并续行。
+
+        规则：
+        - 相邻行垂直间距 < 两行字体高度均值 × gap_ratio → 合并
+        - 含 checkbox 字符的行不参与合并
+        - 返回 (merged_lines, merge_log)
+          merge_log 每条记录：{from_texts, merged_text, gap, avg_font_size, gap_pct}
+        """
+        if not text_lines:
+            return [], []
+
+        # 按 (y, x) 排序
+        sorted_lines = sorted(
+            text_lines,
+            key=lambda ln: (float(ln["bbox"][1]), float(ln["bbox"][0])),
+        )
+
+        checkbox_tokens = {"☐", "☑", "☒", "□", "■", "✓", "✔", "\uf06f", "\uf0fe"}
+
+        def _has_checkbox(text: str) -> bool:
+            if any(ch in checkbox_tokens for ch in text):
+                return True
+            return any(0xF000 <= ord(ch) <= 0xF0FF for ch in text)
+
+        merged: List[Dict[str, Any]] = []
+        merge_log: List[Dict[str, Any]] = []
+
+        i = 0
+        while i < len(sorted_lines):
+            curr = sorted_lines[i]
+            curr_text = curr["text"]
+
+            # checkbox 行不合并，直接保留
+            if _has_checkbox(curr_text):
+                merged.append(dict(curr))
+                i += 1
+                continue
+
+            group_texts = [curr_text]
+            group_bbox = curr["bbox"]
+            group_font_size = float(curr.get("font_size", 0.0))
+            group_gaps: list[dict] = []
+
+            j = i + 1
+            while j < len(sorted_lines):
+                nxt = sorted_lines[j]
+                nxt_text = nxt["text"]
+
+                if _has_checkbox(nxt_text):
+                    break
+
+                nxt_bbox = nxt["bbox"]
+                nxt_font_size = float(nxt.get("font_size", 0.0))
+
+                # 垂直间距 = 下一行顶部 - 当前组底部
+                gap = float(nxt_bbox[1]) - float(group_bbox[3])
+                avg_fs = (group_font_size + nxt_font_size) / 2.0
+                if avg_fs <= 0:
+                    break
+
+                threshold = avg_fs * gap_ratio
+                if gap < 0 or gap >= threshold:
+                    break
+
+                # 合并
+                gap_pct = (gap / avg_fs) * 100.0 if avg_fs > 0 else 0.0
+                group_gaps.append({
+                    "gap": round(gap, 2),
+                    "avg_font_size": round(avg_fs, 2),
+                    "gap_pct": round(gap_pct, 1),
+                })
+                group_texts.append(nxt_text)
+                group_bbox = self._bbox_union(group_bbox, nxt_bbox)
+                group_font_size = avg_fs
+                j += 1
+
+            merged_text = self._normalize_text(" ".join(group_texts))
+            merged.append({
+                "text": merged_text,
+                "bbox": group_bbox,
+                "font_size": round(group_font_size, 2),
+                "page_num": curr.get("page_num", 0),
+            })
+
+            if len(group_texts) > 1:
+                merge_log.append({
+                    "from_texts": group_texts,
+                    "merged_text": merged_text,
+                    "line_count": len(group_texts),
+                    "gaps": group_gaps,
+                })
+
+            i = j
+
+        return merged, merge_log
 
     def extract_drawings(self, page: fitz.Page, page_num: int) -> Dict[str, Any]:
         drawings = page.get_drawings()
