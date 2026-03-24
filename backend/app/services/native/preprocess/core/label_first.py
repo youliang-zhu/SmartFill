@@ -7,8 +7,8 @@ from typing import Any, Dict, List
 
 import fitz
 
-from app.services.native.preprocess.collect_checkboxes import collect_checkboxes
-from app.services.native.preprocess.collect_text_fields import collect_text_fields
+from app.services.native.preprocess.collector.collect_checkboxes import collect_checkboxes
+from app.services.native.preprocess.collector.collect_text_fields import collect_text_fields
 
 
 class LabelFirstMixin:
@@ -42,8 +42,8 @@ class LabelFirstMixin:
         consumed: set[str] = set()
         checkbox_fields, consumed = collect_checkboxes(phase1_data, consumed)
 
-        # Phase 2B：Text 字段收集
-        text_fields, consumed_text = collect_text_fields(phase1_data, consumed)
+        # Phase 2B：Text 字段收集（传入 checkbox 输出作为禁区）
+        text_fields, consumed_text = collect_text_fields(phase1_data, consumed, checkbox_fields=checkbox_fields)
         consumed |= consumed_text
 
         # Phase 2C：table（待实现）

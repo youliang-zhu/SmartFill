@@ -6,10 +6,10 @@ import argparse
 import json
 from pathlib import Path
 
-from app.services.native.preprocess.extraction import ExtractionMixin
-from app.services.native.preprocess.label_first import LabelFirstMixin
-from app.services.native.preprocess.types import LabelCandidate, RectTuple
-from app.services.native.preprocess.utils import UtilityMixin
+from app.services.native.preprocess.core.extraction import ExtractionMixin
+from app.services.native.preprocess.core.label_first import LabelFirstMixin
+from app.services.native.preprocess.core.types import LabelCandidate, RectTuple
+from app.services.native.preprocess.core.utils import UtilityMixin
 
 
 class NativeDetector(LabelFirstMixin, ExtractionMixin, UtilityMixin):

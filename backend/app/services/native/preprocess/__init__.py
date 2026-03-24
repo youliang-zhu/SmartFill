@@ -1,5 +1,5 @@
 from app.services.native.preprocess.detector import NativeDetector, get_native_detector
-from app.services.native.preprocess.types import LabelCandidate, RectTuple
+from app.services.native.preprocess.core.types import LabelCandidate, RectTuple
 
 __all__ = [
     "NativeDetector",

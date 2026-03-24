@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import fitz
 
-from app.services.native.preprocess.types import RectTuple
+from app.services.native.preprocess.core.types import RectTuple
 
 
 class UtilityMixin:

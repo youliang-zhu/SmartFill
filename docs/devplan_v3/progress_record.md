@@ -230,3 +230,30 @@ TestSpace/preprocess_test_v3/
         ├── after/
         └── merge_stats_*.json
 ```
+
+---
+
+## 六、Phase 2 实现进展（2026-03-24）
+
+### 6.1 已完成部分
+
+Phase 2 分为两个并行收集器，均已实现并经过批量测试验证。
+
+Phase 2A（checkbox 收集）目前运行最为稳定。收集器从 Phase 1 数据中识别 checkbox 组，流程是先收集所有 checkbox 位置（来自 `square_boxes` 和字形符号），再按空间邻近度分组，然后为每个 box 查找右侧选项文字，最后在 h/v 线围成的单元格内或水平带状区域内收集对应 label，并把多 label 的情况拆分为 question + additional_text。6 个测试 PDF 共检出 73 个 checkbox 字段，结果与人工核对一致，没有已知 bug。
+
+存在的bug：还有部分左右label没有融合，比如问题的开头1.跟后面的句子离得太远，被识别成两段左右但是没有融合
+
+Phase 2B（text 字段收集）也已完成，逻辑是两步生成 fill_rect：Step 1 针对短段下划线 h_line 直接生成矩形，Step 2 对剩余 label 分别计算右侧候选和下方候选，选更宽的那个。障碍物系统（h_line、v_line、深色背景条、所有文字 bbox）用于确定每个方向的边界，并在最后通过 `_shrink_rect_no_overlap` 做安全收缩，确保 fill_rect 不与任何已有文字重叠。6 个 PDF 共 574 个 text 字段，其中 4 个（008、013、018、019）完全无重叠，整体通过率良好。
+
+存在的bug：
+1. 有些checkbox离得有点距离，导致把checkbox的YES/NO识别成label
+2. 有表格形态的非表格被误认为是表格，从而被这一阶段
+
+
+### 6.2 存在的问题
+
+Phase 2B 仍有两个 PDF 存在残留的重叠问题。001 号 PDF（FDIC f3700-44）有 2 处重叠，成因是页面边缘有一列竖排的页码数字（如"7 7 7 8 8 9"），其 bbox 纵向跨度很大，在水平方向上与 fill_rect 有部分交叉，但由于这个 bbox 的 x 范围并没有完全阻断 fill_rect 的生成路径，`_shrink_rect_no_overlap` 没有将其识别为有效障碍而把 rect 缩短。004 号 PDF（ETA-790）有 6 处重叠，主要出现在相邻 label 之间边界很窄的位置，fill_rect 向右或向下延伸时越界进入了相邻 label 的 bbox 区域，根本原因是障碍物检测的 y 方向容差导致某些 label bbox 未被选为边界截止点。这 8 处残留重叠是当前 Phase 2B 最主要的遗留问题，尚未修复。
+
+### 6.3 代码结构重组
+
+在 Phase 2 实现完成后，对 preprocess 目录做了一次整理。原先 `types.py`、`utils.py`、`extraction.py`、`label_first.py` 四个文件直接散落在 `preprocess/` 根目录下，与 `detector.py` 和 `__init__.py` 混在一起显得杂乱。这次把这四个内部实现文件统一移入新建的 `core/` 子目录，`collector/` 子目录保持不变，根目录只保留 `detector.py`（对外暴露 `NativeDetector`）和 `__init__.py`（包接口）两个面向外部的文件。所有内部 import 路径同步更新，TestSpace 里引用 `preprocess.types` 旧路径的 4 处测试文件也一并修正。重组后跑全套测试（`test_phase1`、`test_checkboxes`、`test_text_fields`、`test_phases_v3`）均通过，无新增 bug。

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from app.services.native.preprocess.types import RectTuple
+from app.services.native.preprocess.core.types import RectTuple
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +462,9 @@ def _find_option_text(
         lb = line["bbox"]
         text = line.get("text", "").strip()
         if not text or _is_checkbox_text(text):
+            continue
+        # 选项文字应为短标签（≤5词）；超过则为条件说明文字，留给 additional_text 收集
+        if len(text.split()) > 3:
             continue
         if abs(_bbox_center_y(lb) - box_cy) > _OPT_TEXT_Y_TOL:
             continue
