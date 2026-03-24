@@ -678,10 +678,8 @@ def _find_labels_for_group(
     if bar_y is not None and bar_y > upper_bound:
         upper_bound = bar_y
 
-    best_up: Optional[Tuple[float, str, RectTuple, int]] = None
+    best_up: Optional[Tuple[float, str, RectTuple, int, bool]] = None
     for idx, line in enumerate(merged_lines):
-        if idx in consumed_line_ids:
-            continue
         ok, text = _ok(line)
         if not ok:
             continue
@@ -692,11 +690,15 @@ def _find_labels_for_group(
         if _inside_shaded_bar(lb):
             continue
         dist_y = group_bbox[1] - lb[3]
+        is_consumed = idx in consumed_line_ids
         if best_up is None or dist_y < best_up[0]:
-            best_up = (dist_y, text, lb, idx)
+            best_up = (dist_y, text, lb, idx, is_consumed)
 
     if best_up is not None:
-        _, q_text, q_bbox, q_idx = best_up
+        if best_up[4]:
+            # 最近的 label 已被占用 → 放弃
+            return "", None, None, []
+        _, q_text, q_bbox, q_idx, _ = best_up
         consumed_line_ids.add(q_idx)
         return q_text, q_bbox, q_idx, []
 

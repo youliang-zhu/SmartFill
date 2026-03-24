@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 import fitz
 
 from app.services.native.preprocess.collect_checkboxes import collect_checkboxes
+from app.services.native.preprocess.collect_text_fields import collect_text_fields
 
 
 class LabelFirstMixin:
@@ -24,6 +25,9 @@ class LabelFirstMixin:
         # Phase 1.5：续行合并（Union-Find pairwise，含矢量边界检查）
         merged_lines, _ = self._merge_continuation_lines(text_lines, drawing_data=drawing_data)
 
+        # Phase 1.6：左右融合（短文本以字母/数字开头且 ≤ 10 字符 → 与右侧合并）
+        merged_lines = self._merge_left_right(merged_lines)
+
         # Phase 1 输出打包
         phase1_data = {
             "page_num": page_num,
@@ -38,8 +42,12 @@ class LabelFirstMixin:
         consumed: set[str] = set()
         checkbox_fields, consumed = collect_checkboxes(phase1_data, consumed)
 
-        # Phase 2B / 2C：text / table（待实现）
-        detected_fields = checkbox_fields
+        # Phase 2B：Text 字段收集
+        text_fields, consumed_text = collect_text_fields(phase1_data, consumed)
+        consumed |= consumed_text
+
+        # Phase 2C：table（待实现）
+        detected_fields = checkbox_fields + text_fields
 
         return {
             "page_num": page_num,

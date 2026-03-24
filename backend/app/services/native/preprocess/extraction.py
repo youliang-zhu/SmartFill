@@ -268,6 +268,73 @@ class ExtractionMixin:
 
         return merged, merge_log
 
+    def _merge_left_right(
+        self,
+        merged_lines: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Phase 1.6：左右融合。
+
+        如果某行以字母或数字开头且总长度 ≤ 10 字符，
+        则将其与水平方向右侧最近的同行 label 合并。
+        """
+        if not merged_lines:
+            return merged_lines
+
+        _MAX_LEN = 10
+        n = len(merged_lines)
+        consumed = [False] * n
+        result: List[Dict[str, Any]] = []
+
+        for i in range(n):
+            if consumed[i]:
+                continue
+            text_i = merged_lines[i]["text"].strip()
+            # 判断是否为短小左侧片段：以字母/数字开头，长度 ≤ 10
+            if (
+                text_i
+                and text_i[0].isalnum()
+                and len(text_i) <= _MAX_LEN
+            ):
+                bi = merged_lines[i]["bbox"]
+                i_cy = (float(bi[1]) + float(bi[3])) / 2.0
+                i_h = float(bi[3]) - float(bi[1])
+                # 找右侧最近的、y 有重叠的行
+                best_j: int | None = None
+                best_gap = float("inf")
+                for j in range(n):
+                    if j == i or consumed[j]:
+                        continue
+                    bj = merged_lines[j]["bbox"]
+                    # j 的左边缘必须在 i 的左边缘右侧（允许部分水平重叠）
+                    if float(bj[0]) <= float(bi[0]):
+                        continue
+                    # y 重叠 > 0
+                    y_overlap = min(float(bi[3]), float(bj[3])) - max(float(bi[1]), float(bj[1]))
+                    if y_overlap <= 0:
+                        continue
+                    gap = float(bj[0]) - float(bi[0])
+                    if gap < best_gap:
+                        best_gap = gap
+                        best_j = j
+                if best_j is not None:
+                    bj = merged_lines[best_j]["bbox"]
+                    new_text = self._normalize_text(text_i + " " + merged_lines[best_j]["text"].strip())
+                    new_bbox = self._bbox_union(bi, bj)
+                    fs_i = float(merged_lines[i].get("font_size", 0))
+                    fs_j = float(merged_lines[best_j].get("font_size", 0))
+                    new_fs = round((fs_i + fs_j) / 2.0, 2)
+                    consumed[best_j] = True
+                    result.append({
+                        "text": new_text,
+                        "bbox": new_bbox,
+                        "font_size": new_fs,
+                        "page_num": merged_lines[i].get("page_num", 0),
+                    })
+                    continue
+            result.append(merged_lines[i])
+
+        return result
+
     def extract_drawings(self, page: fitz.Page, page_num: int) -> Dict[str, Any]:
         drawings = page.get_drawings()
         drawing_items: List[Dict[str, Any]] = []
