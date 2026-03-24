@@ -8,12 +8,11 @@ from pathlib import Path
 
 from app.services.native.preprocess.extraction import ExtractionMixin
 from app.services.native.preprocess.label_first import LabelFirstMixin
-from app.services.native.preprocess.legacy import LegacyEnginesMixin
 from app.services.native.preprocess.types import LabelCandidate, RectTuple
 from app.services.native.preprocess.utils import UtilityMixin
 
 
-class NativeDetector(LabelFirstMixin, LegacyEnginesMixin, ExtractionMixin, UtilityMixin):
+class NativeDetector(LabelFirstMixin, ExtractionMixin, UtilityMixin):
     """Native PDF 结构化检测器。"""
 
 
