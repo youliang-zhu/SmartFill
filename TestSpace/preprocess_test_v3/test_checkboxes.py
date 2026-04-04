@@ -21,7 +21,7 @@ import fitz
 from app.services.native.preprocess.detector import get_native_detector
 from app.services.native.preprocess.collector.collect_checkboxes import collect_checkboxes, _detect_table_zones
 from common import TEST_PDFS, collect_phase1_with_merge, existing_pdf_paths
-from viz_utils import COLOR_RED, COLOR_BLUE, COLOR_ORANGE, COLOR_CYAN, COLOR_GREEN
+from viz_utils import COLOR_RED, COLOR_BLUE, COLOR_ORANGE, COLOR_CYAN, COLOR_GREEN, draw_id_badge
 
 COLOR_PURPLE = (0.6, 0.2, 0.8)
 
@@ -52,16 +52,7 @@ def _draw_checkbox_field(page: fitz.Page, field: Dict[str, Any], idx: int) -> No
         shape.finish(color=COLOR_RED, width=1.5)
         shape.commit()
 
-        # 左上角标注 ID + label
-        label = field.get("label", "")[:50]
-        txt = f"G{gid} {label}"
-        page.insert_text(
-            fitz.Point(rect.x0, max(6.0, rect.y0 - 2.0)),
-            txt,
-            fontsize=5,
-            color=COLOR_RED,
-            fontname="helv",
-        )
+        draw_id_badge(page, rect, f"G{gid}", COLOR_RED, fontsize=6, y_offset=2.0)
 
     # Label bbox（蓝色虚线框 + 文字标注）
     label_bbox = field.get("label_bbox")
@@ -74,16 +65,17 @@ def _draw_checkbox_field(page: fitz.Page, field: Dict[str, Any], idx: int) -> No
 
         label_text = field.get("label", "")[:60]
         if label_text:
+            draw_id_badge(page, lb, f"G{gid} L", COLOR_BLUE, fontsize=5, y_offset=1.0)
             page.insert_text(
-                fitz.Point(lb.x0, max(6.0, lb.y0 - 1.0)),
-                f"G{gid} L: {label_text}",
+                fitz.Point(lb.x0 + 18, max(6.0, lb.y0 - 1.0)),
+                label_text,
                 fontsize=4,
                 color=COLOR_BLUE,
                 fontname="helv",
             )
 
     # 每个 option（红色细框 + 半透明填充 + 右侧标注）
-    for opt in field.get("options", []):
+    for opt_idx, opt in enumerate(field.get("options", []), start=1):
         bbox = opt.get("bbox")
         if not bbox:
             continue
@@ -92,6 +84,7 @@ def _draw_checkbox_field(page: fitz.Page, field: Dict[str, Any], idx: int) -> No
         shape.draw_rect(r)
         shape.finish(color=COLOR_RED, fill=COLOR_RED, fill_opacity=0.15, width=0.8)
         shape.commit()
+        draw_id_badge(page, r, f"G{gid}-O{opt_idx}", COLOR_ORANGE, fontsize=4.5, y_offset=0.5)
 
         opt_text = opt.get("text", "")
         if opt_text:
@@ -104,7 +97,8 @@ def _draw_checkbox_field(page: fitz.Page, field: Dict[str, Any], idx: int) -> No
             )
 
     # Additional text（绿色框 + 文字标注）
-    for at in field.get("additional_text", []):
+    for add_idx, at in enumerate(field.get("additional_text", []), start=1):
+        add_id = f"G{gid}-A{add_idx}"
         # 用 label_bbox 画文字包围框
         at_lb = at.get("label_bbox") or at.get("fill_rect")
         if not at_lb:
@@ -114,16 +108,26 @@ def _draw_checkbox_field(page: fitz.Page, field: Dict[str, Any], idx: int) -> No
         shape.draw_rect(r)
         shape.finish(color=COLOR_GREEN, width=0.6)
         shape.commit()
+        draw_id_badge(page, r, f"{add_id} L", COLOR_GREEN, fontsize=5, y_offset=1.0)
 
         at_label = at.get("label", "")[:40]
         if at_label:
             page.insert_text(
-                fitz.Point(r.x0, max(6.0, r.y0 - 1.0)),
-                f"  G{gid} A: {at_label}",
+                fitz.Point(r.x0 + 26, max(6.0, r.y0 - 1.0)),
+                at_label,
                 fontsize=4,
                 color=COLOR_GREEN,
                 fontname="helv",
             )
+
+        at_fr = at.get("fill_rect")
+        if at_fr:
+            fr = fitz.Rect(at_fr)
+            shape2 = page.new_shape()
+            shape2.draw_rect(fr)
+            shape2.finish(color=COLOR_GREEN, fill=COLOR_GREEN, fill_opacity=0.10, width=0.7)
+            shape2.commit()
+            draw_id_badge(page, fr, add_id, COLOR_GREEN, fontsize=5, y_offset=0.5)
 
 
 def run_one_pdf(pdf_path: str, save_json: bool = False) -> Dict[str, Any]:

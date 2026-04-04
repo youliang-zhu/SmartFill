@@ -43,6 +43,12 @@ _SHADED_BAR_MIN_WIDTH = 200.0    # 最小宽度才视为"分节标题栏"
 _ODL_TEXT_TYPES = {"paragraph", "heading", "caption", "list item", "text block"}
 _ODL_OPTION_TEXTS = {"yes", "no", "true", "false", "si", "sí"}
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_IF_PREFIX_RE = re.compile(r"^\s*[\(\[]?\s*if\s+(?:yes|no|true|false)\b", re.I)
+_LEADING_OPTION_RE = re.compile(r"^\s*(?:yes|no|true|false|si|sí)\b", re.I)
+_TRAILING_OPTION_PAIR_RE = re.compile(
+    r"^(?P<prefix>.+?)\s+(?P<tail>(?:yes(?:\s*/\s*si)?|true)\b.*\b(?:no|false)\b.*)$",
+    re.I,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +112,21 @@ def _token_set(text: str) -> Set[str]:
     return {tok.lower() for tok in _TOKEN_RE.findall(text or "")}
 
 
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _strip_enum_prefix(text: str) -> str:
+    return re.sub(r"^\s*(?:\d+\.\s*|[A-Za-z]\.\s*)", "", _normalize_text(text))
+
+
+def _enum_prefix(text: str) -> str:
+    m = re.match(r"^\s*((?:\d+\.|[A-Za-z]\.))\s*", _normalize_text(text))
+    if not m:
+        return ""
+    return m.group(1)
+
+
 def _looks_like_option_text(text: str) -> bool:
     toks = _token_set(text)
     if not toks:
@@ -114,6 +135,49 @@ def _looks_like_option_text(text: str) -> bool:
         return True
     if len(toks) <= 2 and all(tok in _ODL_OPTION_TEXTS for tok in toks):
         return True
+    return False
+
+
+def _is_polluted_label(text: str) -> bool:
+    toks = _token_set(text)
+    if not toks:
+        return False
+    if {"yes", "no"} <= toks:
+        return True
+    if {"true", "false"} <= toks:
+        return True
+    if "si" in toks and ("yes" in toks or "no" in toks):
+        return True
+    return False
+
+
+def _pollution_mode(text: str) -> str:
+    text = _normalize_text(text)
+    if not _is_polluted_label(text):
+        return "clean"
+    if _LEADING_OPTION_RE.match(text):
+        return "leading_option"
+    if _TRAILING_OPTION_PAIR_RE.match(text):
+        return "trailing_option"
+    return "mixed_option"
+
+
+def _strip_trailing_option_tail(text: str) -> str:
+    m = _TRAILING_OPTION_PAIR_RE.match(_normalize_text(text))
+    if not m:
+        return _normalize_text(text)
+    return _normalize_text(m.group("prefix"))
+
+
+def _options_need_repair(options: List[Dict[str, Any]]) -> bool:
+    if not options:
+        return False
+    for opt in options:
+        text = _normalize_text(str(opt.get("text", "")))
+        if not text:
+            return True
+        if _is_polluted_label(text):
+            return True
     return False
 
 
@@ -245,24 +309,205 @@ def _should_fallback_to_odl(
     cand_label: str,
     cand_bbox: RectTuple | List[float] | None,
 ) -> bool:
-    base_label = (base_label or "").strip()
-    cand_label = (cand_label or "").strip()
+    base_label = _normalize_text(base_label)
+    cand_label = _normalize_text(cand_label)
     if not cand_label or _looks_like_option_text(cand_label):
         return False
     if not base_label:
         return True
 
-    bt = _token_set(base_label)
-    ct = _token_set(cand_label)
+    bt = _token_set(_strip_enum_prefix(base_label))
+    ct = _token_set(_strip_enum_prefix(cand_label))
     token_overlap = (len(bt & ct) / max(1, len(bt))) if bt and ct else 0.0
     overlap = _overlap_ratio_small(base_bbox, cand_bbox)
     wider = _width_ratio(base_bbox, cand_bbox)
 
-    if overlap >= 0.6 and wider >= 1.5 and len(cand_label) >= len(base_label) + 20 and token_overlap >= 0.3:
+    if overlap >= 0.6 and wider >= 1.5 and len(cand_label) >= len(base_label) + 20 and token_overlap >= 0.8:
         return True
     if len(base_label) <= 18 and overlap >= 0.6 and len(cand_label) >= len(base_label) + 15:
         return True
     return False
+
+
+def _hline_fill_for_bbox(
+    bbox: RectTuple,
+    h_lines: List[Dict[str, float]],
+) -> RectTuple:
+    best_hl: Optional[Dict[str, float]] = None
+    best_d = float("inf")
+    for hl in h_lines:
+        hy = float(hl.get("y", 0.0))
+        if hy < bbox[1]:
+            continue
+        hx0 = float(hl.get("x0", 0.0))
+        hx1 = float(hl.get("x1", 0.0))
+        if max(0.0, min(hx1, bbox[2]) - max(hx0, bbox[0])) > 0 and hy - bbox[3] < best_d:
+            best_d = hy - bbox[3]
+            best_hl = hl
+    if best_hl is not None:
+        hy = float(best_hl["y"])
+        return (
+            round(float(best_hl["x0"]), 2), round(hy - 1, 2),
+            round(float(best_hl["x1"]), 2), round(hy, 2),
+        )
+    return bbox
+
+
+def _find_clean_label_above(
+    group_bbox: RectTuple,
+    merged_lines: List[Dict[str, Any]],
+    consumed_line_ids: Set[int],
+    h_lines: List[Dict[str, float]],
+    shaded_bars: List[RectTuple],
+) -> Tuple[str, Optional[RectTuple], int | None]:
+    gcx = _bbox_center_x(group_bbox)
+    group_left = group_bbox[0]
+    nearest_hline_y: Optional[float] = None
+    for hl in h_lines:
+        hy = float(hl.get("y", 0.0))
+        hx0 = float(hl.get("x0", 0.0))
+        hx1 = float(hl.get("x1", 0.0))
+        if hy < group_bbox[1] and hx0 - 10 <= gcx <= hx1 + 10:
+            if nearest_hline_y is None or hy > nearest_hline_y:
+                nearest_hline_y = hy
+    upper_bound = nearest_hline_y if nearest_hline_y is not None else 0.0
+
+    best: Optional[Tuple[float, str, RectTuple, int]] = None
+    for idx, line in enumerate(merged_lines):
+        if idx in consumed_line_ids:
+            continue
+        text = _normalize_text(str(line.get("text", "")))
+        if not text or _looks_like_option_text(text) or _is_polluted_label(text) or _IF_PREFIX_RE.match(text):
+            continue
+        lb = line["bbox"]
+        lcy = _bbox_center_y(lb)
+        if not (upper_bound - 2 <= lcy < group_bbox[1]):
+            continue
+        if lb[0] > group_left + 30:
+            continue
+        if any(bar[0] - 5 <= _bbox_center_x(lb) <= bar[2] + 5 and bar[1] - 2 <= lcy <= bar[3] + 2 for bar in shaded_bars):
+            continue
+        dist_y = group_bbox[1] - lb[3]
+        if best is None or dist_y < best[0]:
+            best = (dist_y, text, lb, idx)
+    if best is None:
+        return "", None, None
+    return best[1], best[2], best[3]
+
+
+def _split_option_pair_text(text: str) -> List[str]:
+    toks = _token_set(text)
+    if {"true", "false"} <= toks:
+        return ["True", "False"]
+    if {"yes", "no"} <= toks or ("si" in toks and "no" in toks):
+        first = "Yes/Si" if "si" in toks else "Yes"
+        return [first, "No"]
+    return []
+
+
+def _build_group_options(
+    group: List[Dict[str, Any]],
+    option_texts: List[str],
+) -> List[Dict[str, Any]]:
+    options: List[Dict[str, Any]] = []
+    for idx, cb in enumerate(group):
+        text = option_texts[idx] if idx < len(option_texts) else ""
+        options.append({"text": text, "bbox": list(cb["bbox"])})
+    return options
+
+
+def _extract_odl_row_metadata(
+    group: List[Dict[str, Any]],
+    group_bbox: RectTuple,
+    odl_lines: List[Dict[str, Any]],
+    h_lines: List[Dict[str, float]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    row_lines: List[Dict[str, Any]] = []
+    group_cy = _bbox_center_y(group_bbox)
+    for line in odl_lines:
+        text = _normalize_text(str(line.get("text", "")))
+        if not text:
+            continue
+        bbox = tuple(line.get("bbox", []))
+        if len(bbox) != 4:
+            continue
+        if abs(_bbox_center_y(bbox) - group_cy) > 18.0:
+            continue
+        if _looks_like_option_text(text) or _is_polluted_label(text):
+            if bbox[2] < group_bbox[0] - 5:
+                continue
+        elif bbox[0] < group_bbox[0] - 5:
+            continue
+        row_lines.append({"text": text, "bbox": list(bbox)})
+
+    option_lines = [ln for ln in row_lines if _looks_like_option_text(ln["text"]) or _is_polluted_label(ln["text"])]
+    additional: List[Dict[str, Any]] = []
+    for ln in row_lines:
+        if ln in option_lines:
+            continue
+        if _IF_PREFIX_RE.match(ln["text"]) or ln["bbox"][0] >= group_bbox[2] - 5:
+            bbox = tuple(ln["bbox"])
+            additional.append({
+                "label": ln["text"],
+                "label_bbox": list(bbox),
+                "fill_rect": list(_hline_fill_for_bbox(bbox, h_lines)),
+            })
+
+    if len(option_lines) == 1 and len(group) == 2:
+        split = _split_option_pair_text(option_lines[0]["text"])
+        if split:
+            return _build_group_options(group, split), additional
+
+    option_lines.sort(key=lambda ln: (ln["bbox"][0], ln["bbox"][1]))
+    option_texts = [ln["text"] for ln in option_lines]
+    return _build_group_options(group, option_texts), additional
+
+
+def _find_odl_completion_candidate(
+    baseline_label: str,
+    baseline_bbox: RectTuple | List[float] | None,
+    group_bbox: RectTuple,
+    odl_lines: List[Dict[str, Any]],
+    allow_shorter: bool = False,
+) -> Tuple[str, Optional[RectTuple]]:
+    baseline_label = _normalize_text(baseline_label)
+    if not baseline_label or baseline_bbox is None:
+        return "", None
+    baseline_core = _strip_enum_prefix(_strip_trailing_option_tail(baseline_label))
+    baseline_tokens = _token_set(baseline_core)
+    if not baseline_tokens:
+        return "", None
+
+    best: Optional[Tuple[float, str, RectTuple]] = None
+    for line in _filter_odl_label_lines(odl_lines, group_bbox):
+        text = _normalize_text(str(line.get("text", "")))
+        if not text or _looks_like_option_text(text) or _is_polluted_label(text) or _IF_PREFIX_RE.match(text):
+            continue
+        bbox = tuple(line.get("bbox", []))
+        if len(bbox) != 4:
+            continue
+        cand_tokens = _token_set(_strip_enum_prefix(text))
+        overlap = len(baseline_tokens & cand_tokens) / max(1, len(baseline_tokens))
+        if overlap < 0.8:
+            continue
+        if abs(float(bbox[0]) - float(baseline_bbox[0])) > 18:
+            continue
+        if float(bbox[1]) > float(baseline_bbox[1]) + 8:
+            continue
+        if float(bbox[2]) < float(baseline_bbox[2]) - 20:
+            continue
+        if not allow_shorter and len(text) < len(baseline_label) + 8:
+            continue
+        score = overlap * 1000.0 + len(text)
+        if best is None or score > best[0]:
+            best = (score, text, bbox)
+    if best is None:
+        return "", None
+    prefixed = best[1]
+    prefix = _enum_prefix(baseline_label)
+    if prefix and not _enum_prefix(prefixed):
+        prefixed = f"{prefix} {prefixed}"
+    return prefixed, best[2]
 
 
 def _detect_table_zones(
@@ -939,8 +1184,6 @@ def collect_checkboxes(
     fields: List[Dict[str, Any]] = []
     consumed_line_ids: Set[int] = set()
     odl_lines = _load_odl_text_lines(pdf_path=pdf_path, page_num=int(phase1_data.get("page_num", 0)), page_size=page_size)
-    consumed_odl_line_ids: Set[int] = set()
-
     # 先标记纯 checkbox 字形行为已消耗
     for idx, line in enumerate(merged_lines):
         if _is_checkbox_text(line.get("text", "")):
@@ -966,19 +1209,61 @@ def collect_checkboxes(
             shaded_bars=shaded_bars,
         )
 
-        if odl_lines:
-            odl_candidate_lines = _filter_odl_label_lines(odl_lines, group_bbox)
-            odl_q_text, odl_q_bbox, _, _ = _find_labels_for_group(
-                group_bbox,
-                odl_candidate_lines,
-                consumed_odl_line_ids,
-                h_lines,
-                v_lines,
+        pollution_mode = _pollution_mode(q_text)
+        if pollution_mode == "leading_option":
+            clean_up_text, clean_up_bbox, clean_up_idx = _find_clean_label_above(
+                group_bbox=group_bbox,
+                merged_lines=merged_lines,
+                consumed_line_ids=consumed_line_ids,
+                h_lines=h_lines,
                 shaded_bars=shaded_bars,
             )
-            if _should_fallback_to_odl(q_text, q_bbox, odl_q_text, odl_q_bbox):
-                q_text = odl_q_text
-                q_bbox = odl_q_bbox
+            if clean_up_text and clean_up_bbox is not None:
+                q_text = clean_up_text
+                q_bbox = clean_up_bbox
+                if clean_up_idx is not None:
+                    consumed_line_ids.add(clean_up_idx)
+        elif pollution_mode == "trailing_option":
+            q_text = _strip_trailing_option_tail(q_text)
+
+        if odl_lines:
+            odl_row_options, odl_additional = _extract_odl_row_metadata(group, group_bbox, odl_lines, h_lines)
+
+            if pollution_mode == "leading_option":
+                if _options_need_repair(options) and any(_normalize_text(opt.get("text", "")) for opt in odl_row_options):
+                    options = odl_row_options
+                if odl_additional:
+                    additional = odl_additional
+
+            elif pollution_mode == "trailing_option":
+                odl_fix_text, odl_fix_bbox = _find_odl_completion_candidate(
+                    baseline_label=q_text,
+                    baseline_bbox=q_bbox,
+                    group_bbox=group_bbox,
+                    odl_lines=odl_lines,
+                    allow_shorter=True,
+                )
+                if odl_fix_text and odl_fix_bbox is not None:
+                    q_text = odl_fix_text
+                    q_bbox = odl_fix_bbox
+                if _options_need_repair(options) and any(_normalize_text(opt.get("text", "")) for opt in odl_row_options):
+                    options = odl_row_options
+                if odl_additional and not additional:
+                    additional = odl_additional
+
+            else:
+                odl_q_text, odl_q_bbox = _find_odl_completion_candidate(
+                    baseline_label=q_text,
+                    baseline_bbox=q_bbox,
+                    group_bbox=group_bbox,
+                    odl_lines=odl_lines,
+                    allow_shorter=False,
+                )
+                if odl_q_text and odl_q_bbox is not None:
+                    q_text = odl_q_text
+                    q_bbox = odl_q_bbox
+                if _options_need_repair(options) and any(_normalize_text(opt.get("text", "")) for opt in odl_row_options):
+                    options = odl_row_options
 
         # 组的外包围框（仅 checkbox + options，不含 label）
         fill_rect = group_bbox

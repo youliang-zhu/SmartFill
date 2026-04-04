@@ -14,7 +14,13 @@
 
 **描述**：部分 label 的开头编号（如 "1."、"a."）与右侧正文在 PDF 内间距过大，Phase 1.5 续行合并逻辑不处理横向拼接，导致编号单独成一行，正文另成一行，两者没有被融合成一条完整 label。
 
-**具体实例**：尚未在6个测试 PDF 中确认到该 bug 的具体字段（Phase 1.6 的 `_merge_left_right` 已处理了短编号前缀的情况，当前测试中未发现遗漏）。
+### 实例 bug1-1（未完全修复，已做一次阈值调整）
+- **PDF**：001 (f3700-44.pdf)，第 6 页
+- **字段**：checkbox group_id=1 上方题干，期望为 `c. Lessor has not received any written complaints or otherwise become aware of any problems with respect to that water quality.`
+- **Bug 时效果**：Phase 1 输出中该题干被拆成两块：`c. quality.` 和 `Lessor has not received any written complaints or otherwise become aware of any problems with respect to that water`。后续 checkbox 收集阶段只拿到了左侧短块，导致 `label_bbox` 过小且偏左。
+- **根因**：原始 PDF 文本层本身把这句画成三段（`c.` / 长句 / `quality.`）；Phase 1.5 先把 `c.` 与 `quality.` 纵向合并为 `c. quality.`，但 Phase 1.6 `_merge_left_right` 只允许长度 `≤ 10` 的左侧碎片继续向右融合，因此 `c. quality.`（11 字符）被卡住，没有再与右侧长句合并。
+- **已做改动**：将 `backend/app/services/native/preprocess/core/extraction.py` 中 Phase 1.6 `_merge_left_right` 的短片段阈值从 `10` 提高到 `15`。
+- **验证结果**：重新运行 `python3 TestSpace/preprocess_test_v3/test_checkboxes.py --pdf 001 --json` 后，Phase 1 确实把原先分开的两块进一步合并成了一条更长的 merged_line，但结果仍不正确，当前输出变为 `c. quality. Lessor has not received any written complaints or otherwise become aware of any problems with respect to that water`，顺序错误，且末尾 `quality.` 仍未落在正确句尾。因此该 bug 仅部分缓解，尚未完全修复。
 
 **期望效果**：merged_lines 中 "1." 和后续文字合并为 "1. Employer's Name and Address"。
 **当前 bug 效果**：merged_lines 中出现 text="1."（单独一条）和 text="Employer's Name and Address"（另一条）。

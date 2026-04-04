@@ -618,4 +618,3 @@ class ExtractionMixin:
                 lines.append(ln)
         lines.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
         return lines
-

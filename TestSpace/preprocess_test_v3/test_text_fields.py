@@ -22,7 +22,7 @@ from app.services.native.preprocess.detector import get_native_detector
 from app.services.native.preprocess.collector.collect_checkboxes import collect_checkboxes, _detect_table_zones
 from app.services.native.preprocess.collector.collect_text_fields import collect_text_fields
 from common import TEST_PDFS, collect_phase1_with_merge, existing_pdf_paths
-from viz_utils import COLOR_BLUE, COLOR_GREEN, COLOR_GRAY, COLOR_RED, COLOR_ORANGE
+from viz_utils import COLOR_BLUE, COLOR_GREEN, COLOR_GRAY, COLOR_RED, COLOR_ORANGE, draw_id_badge
 
 COLOR_PURPLE = (0.6, 0.2, 0.8)
 COLOR_TEAL = (0.0, 0.6, 0.5)
@@ -155,12 +155,15 @@ def run_one_pdf(pdf_path: str, save_json: bool = False) -> Dict[str, Any]:
             shape.draw_rect(r)
             shape.finish(color=COLOR_TEAL, fill=COLOR_TEAL, fill_opacity=0.08, width=0.8)
             shape.commit()
+            draw_id_badge(page, r, f"T{idx} L", COLOR_TEAL, fontsize=5, y_offset=1.0)
 
             label = field.get("label", "")[:50]
             page.insert_text(
-                fitz.Point(r.x0, max(6.0, r.y0 - 1.0)),
-                f"T{idx}: {label}",
-                fontsize=4, color=COLOR_TEAL, fontname="helv",
+                fitz.Point(r.x0 + 18, max(6.0, r.y0 - 1.0)),
+                label,
+                fontsize=4,
+                color=COLOR_TEAL,
+                fontname="helv",
             )
 
             # fill_rect（绿色半透明 + 标注）
@@ -171,11 +174,7 @@ def run_one_pdf(pdf_path: str, save_json: bool = False) -> Dict[str, Any]:
                 shape2.draw_rect(fr_rect)
                 shape2.finish(color=COLOR_GREEN, fill=COLOR_GREEN, fill_opacity=0.12, width=0.6)
                 shape2.commit()
-                page.insert_text(
-                    fitz.Point(fr_rect.x0 + 1, fr_rect.y0 + 7),
-                    f"T{idx}: {label}",
-                    fontsize=4, color=COLOR_GREEN, fontname="helv",
-                )
+                draw_id_badge(page, fr_rect, f"T{idx}", COLOR_GREEN, fontsize=5, y_offset=0.5)
 
     render_doc.save(str(out_pdf))
     render_doc.close()
