@@ -31,6 +31,7 @@ class LabelFirstMixin:
         # Phase 1 输出打包
         phase1_data = {
             "page_num": page_num,
+            "pdf_path": pdf_path,
             "page_size": page_rect,
             "text_spans": text_spans,
             "text_lines": merged_lines,
@@ -75,4 +76,3 @@ class LabelFirstMixin:
             "detected_field_count": total_fields,
             "pages": pages,
         }
-
