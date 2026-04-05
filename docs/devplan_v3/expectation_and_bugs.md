@@ -155,3 +155,42 @@
 # 阶段4：组合 text label+rect 以及 checkbox text+rect
 
 **期望**：最终输出的 `detected_fields` 中，text 类型字段包含完整 label 和不越界的 fill_rect；checkbox 类型字段包含正确 label、所有 options、以及完整的 additional_text 列表（每条附带 fill_rect）。
+
+---
+
+# 附录：`/tmp` 已验证有效方案与主代码迁移状态（2026-04-05）
+
+本节记录本轮 debug 中在 `/tmp` 临时实验里验证过、且效果明确为正向的方案，避免后续迁移时丢失上下文。
+
+说明：
+- “已迁移”表示当前主代码中已有对应实现。
+- “部分迁移”表示只迁移了其中一部分，仍有关键缺口。
+- “未迁移”表示方案仍只存在于 `/tmp` 实验脚本中。
+
+| 方案 | `/tmp` 验证证据 | 主代码迁移状态 | 当前缺口 |
+|------|------------------|----------------|---------|
+| `checkbox polluted-label split strategy`：把污染组分为 `leading option pollution` / `trailing option pollution`；`leading` 组优先向上找问题 label，`trailing` 组只裁掉尾部 option 污染；同时允许 ODL 修补 option / additional / completion | `/tmp/odl_checkbox_experiment/checkbox_pollution_experiments.py`、`/tmp/odl_checkbox_experiment/checkbox_pollution_experiments.json`、`/tmp/odl_checkbox_experiment/manual_review/`。该策略在 `001 p8`、`004 p5/p6`、`008 p1` 上人工复核后效果最好。 | **已迁移** | 该主线已落在 `backend/app/services/native/preprocess/collector/collect_checkboxes.py`，包括 `_pollution_mode`、`_find_clean_label_above`、`_strip_trailing_option_tail`、`_extract_odl_row_metadata`、`_find_odl_completion_candidate` 等。 |
+| `checkbox additional priority rect`：additional label 不再复用“最近 h_line -> 1pt 细线 rect”，而是生成真实可填写区域；该 rect 应作为高优先级保护区，优先于普通 text field | `/tmp/odl_checkbox_priority_experiment/008_p1_checkbox_priority_summary.json`。例如 `008 p1 G5-A1` 在实验里从细线 rect 变为 `[339.84, 367.63, 590.4, 385.62]`。 | **已迁移（ODL 启用时）** | 主代码已在 `backend/app/services/native/preprocess/collector/collect_checkboxes.py` 中增加 additional rect 后处理；但如果未启用 ODL raw dir，某些依赖 ODL completion 的页面仍只能保持 baseline checkbox 结果。 |
+| `checkbox additional rect` 的边界计算：right / below 双候选取面积更大者；左边界不应比 additional label 更靠左；边界需同时考虑 `v_lines`、`h_lines`、横向阴影条、竖向黑色填充条 | `/tmp/odl_checkbox_priority_experiment/batch_20260404T200655Z/summary.json` 及对应 overlay。该轮实验修正了 `008 p1` 的 `G1-A1 / G4-A1 / G5-A1 / G6-A1 / G8-A1 / G9-A1` 越过右侧黑色边界的问题。 | **已迁移（ODL 启用时）** | 主代码已迁入 additional rect 的几何后处理；后续仍需继续观察不同 PDF 上是否存在新的过度保守裁剪。 |
+| `ODL completion -> absorbed continuation lines consume`：当 checkbox 借助 ODL 把主问题补全后，被补全覆盖的原始续行也要一起 consumed，避免后续再被 `Phase 2B` 生成为独立 text field | `/tmp/odl_checkbox_priority_experiment/008_p1_checkbox_priority_summary.json`。实验中 `in the past 5 years?` 与 `employees of the United States Courts?` 被 absorbed 后，不再出现在 text fields 中。 | **已迁移（ODL 启用时）** | 主代码现已在 checkbox 后处理中吸收这些续行；但该行为同样依赖 ODL completion 被触发。 |
+| `text separator-aware allowed region`：每个 text label 的 rect 只能落在自己的允许区域里；允许区域同时受矢量线、表格边框、横向阴影条、竖向黑色填充条、同行下一个 label 的 `x0`、同列下一个 label 的 `y0` 共同约束 | `/tmp/text_rect_separator_experiment.py`、`/tmp/text_rect_separator_experiment/004_p1_separator_aware_text_rects.json`。最早用于修复 `004 p1 T5` 跑到右栏的问题。 | **已迁移** | 已迁移到 `backend/app/services/native/preprocess/collector/collect_text_fields.py`，包括 `_extract_dark_vertical_edges`、`_extract_dark_horizontal_edges`、`_find_vertical_edge`、`_find_column_right_edge`，以及 `Separator-Aware Allowed Region Refinement` 主逻辑。 |
+| `text rect collision resolution`：在 allowed-region 之后继续复用正式代码的两步碰撞消解（同行裁剪 + 全局 shrink） | `/tmp/text_rect_separator_experiment.py` 与 batch 结果 `/tmp/text_rect_separator_experiment/batch_text_20260405T101611Z/summary.json`。该轮实验把 batch overlap 从 `26` 压到 `1`。 | **已迁移** | 主代码 `collect_text_fields.py` 末尾已保留并继续使用这两步冲突消解。 |
+
+## 当前主代码与历史状态补充
+
+- 当前 `git log` 中与本轮相关的最近提交可见：
+  - `487b560 stable checkbox process`
+  - `597433c Add optional ODL-backed checkbox label fallback`
+  - `33e1661 unstable fill rect`
+- 其中：
+  - `checkbox polluted-label split strategy` 属于已落入当前 `collect_checkboxes.py` 的主逻辑。
+  - `text separator-aware allowed region + collision resolution` 已迁到当前 `collect_text_fields.py`，但截至 2026-04-05 仍处于本地未提交状态。
+  - `checkbox additional priority rect` 与 `absorbed continuation lines consume` 已迁入当前 `collect_checkboxes.py`，但属于 ODL 启用时的增强路径。
+
+## 后续迁移优先级建议
+
+1. 继续做批量回归
+- 重点看 `008`、`001`、`004`，确认 high-priority checkbox additional rect 在 ODL 启用的完整链路里稳定保护普通 text field。
+
+2. 评估是否要把 ODL raw dir 配置前移到统一测试入口
+- 当前 `text_fields` 侧对 checkbox 的 ODL 增强依赖环境变量；如果测试时不带该变量，会看到 baseline 行为。

@@ -66,6 +66,20 @@ def _bbox_union(a: RectTuple, b: RectTuple) -> RectTuple:
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
 
+def _bbox_overlap_x(
+    a: RectTuple | List[float],
+    b: RectTuple | List[float],
+) -> float:
+    return max(0.0, min(float(a[2]), float(b[2])) - max(float(a[0]), float(b[0])))
+
+
+def _bbox_overlap_y(
+    a: RectTuple | List[float],
+    b: RectTuple | List[float],
+) -> float:
+    return max(0.0, min(float(a[3]), float(b[3])) - max(float(a[1]), float(b[1])))
+
+
 def _bbox_area(bbox: RectTuple | List[float] | None) -> float:
     if not bbox:
         return 0.0
@@ -510,6 +524,115 @@ def _find_odl_completion_candidate(
     return prefixed, best[2]
 
 
+def _collect_reserved_rects(
+    checkbox_fields: List[Dict[str, Any]],
+    current_field_idx: int,
+    current_add_idx: int,
+) -> List[RectTuple]:
+    reserved: List[RectTuple] = []
+    for fi, field in enumerate(checkbox_fields):
+        lb = field.get("label_bbox")
+        if lb and len(lb) == 4:
+            reserved.append(tuple(float(v) for v in lb))
+        fr = field.get("fill_rect")
+        if fr and len(fr) == 4:
+            reserved.append(tuple(float(v) for v in fr))
+        for ai, add in enumerate(field.get("additional_text", [])):
+            if fi == current_field_idx and ai == current_add_idx:
+                continue
+            alb = add.get("label_bbox")
+            if alb and len(alb) == 4:
+                reserved.append(tuple(float(v) for v in alb))
+            afr = add.get("fill_rect")
+            if afr and len(afr) == 4:
+                reserved.append(tuple(float(v) for v in afr))
+    return reserved
+
+
+def _best_additional_rect(
+    label_bbox: List[float],
+    page_size: RectTuple,
+    merged_lines: List[Dict[str, Any]],
+    h_lines: List[Dict[str, Any]],
+    reserved_rects: List[RectTuple],
+    v_lines: List[Dict[str, float]],
+    shaded_bars: List[RectTuple],
+    dark_vertical_edges: List[RectTuple],
+    dark_horizontal_edges: List[RectTuple],
+) -> Optional[List[float]]:
+    lx0, ly0, lx1, ly1 = [float(v) for v in label_bbox]
+    page_right = float(page_size[2])
+    page_bottom = float(page_size[3])
+
+    below_y1 = _next_bottom_boundary(
+        lx0, page_right, ly1, page_bottom,
+        merged_lines, h_lines, reserved_rects, shaded_bars, dark_horizontal_edges,
+    )
+    below_x1 = _next_right_boundary(
+        lx0, ly1, below_y1, page_right,
+        merged_lines, reserved_rects, v_lines, shaded_bars, dark_vertical_edges,
+    )
+    below = _valid_rect([lx0, ly1, max(lx0, below_x1), max(ly1, below_y1)])
+
+    right_x0 = max(lx1, lx0 + 1.0)
+    right_y1 = _next_bottom_boundary(
+        right_x0, page_right, ly0, page_bottom,
+        merged_lines, h_lines, reserved_rects, shaded_bars, dark_horizontal_edges,
+    )
+    right_x1 = _next_right_boundary(
+        right_x0, ly0, right_y1, page_right,
+        merged_lines, reserved_rects, v_lines, shaded_bars, dark_vertical_edges,
+    )
+    right = _valid_rect([right_x0, ly0, max(right_x0, right_x1), max(ly0, right_y1)])
+
+    if below and right:
+        return below if _bbox_area(below) >= _bbox_area(right) else right
+    return below or right
+
+
+def _line_looks_like_option(text: str) -> bool:
+    text = _normalize_text(text)
+    if not text:
+        return True
+    if _looks_like_option_text(text):
+        return True
+    return bool(_token_set(text)) and _token_set(text) <= {"yes", "no", "true", "false", "si", "sí"}
+
+
+def _is_absorbed_suffix_line(
+    line_text: str,
+    line_bbox: List[float],
+    field: Dict[str, Any],
+) -> bool:
+    label = _normalize_text(str(field.get("label", "")))
+    label_bbox = field.get("label_bbox")
+    group_fill = field.get("fill_rect")
+    if not label or not label_bbox or not group_fill:
+        return False
+    if _line_looks_like_option(line_text) or _IF_PREFIX_RE.match(_normalize_text(line_text)):
+        return False
+
+    line_core = _strip_enum_prefix(line_text)
+    label_core = _strip_enum_prefix(label)
+    if not line_core or line_core == label_core:
+        return False
+    if len(_token_set(line_core)) < 3:
+        return False
+
+    line_x0, line_y0, line_x1, line_y1 = [float(v) for v in line_bbox]
+    if line_x1 > float(group_fill[0]) - 8.0:
+        return False
+    if line_y0 < float(label_bbox[1]) - 3.0:
+        return False
+    if line_y1 > float(group_fill[3]) + 35.0:
+        return False
+
+    lt = _token_set(line_core)
+    qt = _token_set(label_core)
+    overlap = len(lt & qt) / max(1, len(lt))
+    return line_core in label_core or overlap >= 0.8
+
+
 def _detect_table_zones(
     tables: List[Dict[str, Any]],
     all_v_lines: List[Dict[str, float]] | None = None,
@@ -670,6 +793,176 @@ def _extract_shaded_bars(
         if not unique or abs(b[1] - unique[-1][1]) > 3:
             unique.append(b)
     return unique
+
+
+def _extract_dark_vertical_edges(
+    drawings: List[Dict[str, Any]],
+) -> List[RectTuple]:
+    edges: List[RectTuple] = []
+    for d in drawings:
+        fill = d.get("fill")
+        rect = d.get("rect")
+        if fill is None or rect is None:
+            continue
+        if not (isinstance(fill, (list, tuple)) and len(fill) >= 3):
+            continue
+        if sum(float(c) for c in fill[:3]) > 0.25:
+            continue
+        if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
+            continue
+        x0, y0, x1, y1 = [float(v) for v in rect]
+        if 0.0 < (x1 - x0) <= 2.0 and (y1 - y0) >= 8.0:
+            edges.append((x0, y0, x1, y1))
+    edges.sort(key=lambda r: (r[0], r[1]))
+    return edges
+
+
+def _extract_dark_horizontal_edges(
+    drawings: List[Dict[str, Any]],
+) -> List[RectTuple]:
+    edges: List[RectTuple] = []
+    for d in drawings:
+        fill = d.get("fill")
+        rect = d.get("rect")
+        if fill is None or rect is None:
+            continue
+        if not (isinstance(fill, (list, tuple)) and len(fill) >= 3):
+            continue
+        if sum(float(c) for c in fill[:3]) > 0.25:
+            continue
+        if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
+            continue
+        x0, y0, x1, y1 = [float(v) for v in rect]
+        if 0.0 < (y1 - y0) <= 2.0 and (x1 - x0) >= 8.0:
+            edges.append((x0, y0, x1, y1))
+    edges.sort(key=lambda r: (r[1], r[0]))
+    return edges
+
+
+def _find_shaded_right_edge(x: float, shaded_bars: List[RectTuple]) -> Optional[float]:
+    best: Optional[float] = None
+    for bx0, _by0, bx1, _by1 in shaded_bars:
+        if bx0 <= x + 1.0 and bx1 > x + 1.0:
+            if best is None or bx1 < best:
+                best = bx1
+    return best
+
+
+def _find_vertical_edge(
+    x0: float,
+    y0: float,
+    y1: float,
+    v_lines: List[Dict[str, float]],
+    dark_vertical_edges: List[RectTuple],
+) -> Optional[float]:
+    best: Optional[float] = None
+    probe = (x0, y0, x0 + 1.0, y1)
+    for vl in v_lines:
+        vx = float(vl.get("x", 0.0))
+        vy0 = float(vl.get("y0", 0.0))
+        vy1 = float(vl.get("y1", 0.0))
+        if vx <= x0 + 1.0:
+            continue
+        if _bbox_overlap_y((vx, vy0, vx + 0.1, vy1), probe) > 1.0:
+            best = vx if best is None else min(best, vx)
+    for ex0, ey0, ex1, ey1 in dark_vertical_edges:
+        if ex0 <= x0 + 1.0:
+            continue
+        if _bbox_overlap_y((ex0, ey0, ex1, ey1), probe) > 1.0:
+            best = ex0 if best is None else min(best, ex0)
+    return best
+
+
+def _next_bottom_boundary(
+    x0: float,
+    x1: float,
+    y0: float,
+    page_bottom: float,
+    merged_lines: List[Dict[str, Any]],
+    h_lines: List[Dict[str, Any]],
+    reserved_rects: List[RectTuple],
+    shaded_bars: List[RectTuple],
+    dark_horizontal_edges: List[RectTuple],
+) -> float:
+    best = page_bottom
+    probe = (x0, y0, x1, page_bottom)
+    for line in merged_lines:
+        lb = tuple(float(v) for v in line.get("bbox", []))
+        if len(lb) != 4:
+            continue
+        if lb[1] <= y0 + 0.5:
+            continue
+        if _bbox_overlap_x(lb, probe) > 2.0:
+            best = min(best, lb[1])
+    for rr in reserved_rects:
+        if rr[1] <= y0 + 0.5:
+            continue
+        if _bbox_overlap_x(rr, probe) > 2.0:
+            best = min(best, rr[1])
+    for hl in h_lines:
+        hy = float(hl.get("y", 0.0))
+        hx0 = float(hl.get("x0", 0.0))
+        hx1 = float(hl.get("x1", 0.0))
+        if hy <= y0 + 0.5:
+            continue
+        if _bbox_overlap_x((hx0, y0, hx1, hy), probe) > 2.0:
+            best = min(best, hy)
+    for bar in shaded_bars:
+        if bar[1] <= y0 + 0.5:
+            continue
+        if _bbox_overlap_x(bar, probe) > 2.0:
+            best = min(best, bar[1])
+    for edge in dark_horizontal_edges:
+        if edge[1] <= y0 + 0.5:
+            continue
+        if _bbox_overlap_x(edge, probe) > 2.0:
+            best = min(best, edge[1])
+    return best
+
+
+def _next_right_boundary(
+    x0: float,
+    y0: float,
+    y1: float,
+    page_right: float,
+    merged_lines: List[Dict[str, Any]],
+    reserved_rects: List[RectTuple],
+    v_lines: List[Dict[str, float]],
+    shaded_bars: List[RectTuple],
+    dark_vertical_edges: List[RectTuple],
+) -> float:
+    best = page_right
+    probe = (x0, y0, page_right, y1)
+    shaded_edge = _find_shaded_right_edge(x0, shaded_bars)
+    if shaded_edge is not None:
+        best = min(best, shaded_edge)
+    vertical_edge = _find_vertical_edge(x0, y0, y1, v_lines, dark_vertical_edges)
+    if vertical_edge is not None:
+        best = min(best, vertical_edge)
+    for line in merged_lines:
+        lb = tuple(float(v) for v in line.get("bbox", []))
+        if len(lb) != 4:
+            continue
+        if lb[0] <= x0 + 0.5:
+            continue
+        if _bbox_overlap_y(lb, probe) > 1.0:
+            best = min(best, lb[0])
+    for rr in reserved_rects:
+        if rr[0] <= x0 + 0.5:
+            continue
+        if _bbox_overlap_y(rr, probe) > 1.0:
+            best = min(best, rr[0])
+    return best
+
+
+def _valid_rect(rect: List[float] | None) -> Optional[List[float]]:
+    if not rect:
+        return None
+    w = float(rect[2]) - float(rect[0])
+    h = float(rect[3]) - float(rect[1])
+    if w < 24.0 or h < 6.0:
+        return None
+    return [round(float(v), 2) for v in rect]
 
 
 def _shaded_bar_between_y(
@@ -1169,6 +1462,8 @@ def collect_checkboxes(
     v_lines: List[Dict[str, float]] = drawing_data.get("vertical_lines", [])
     raw_drawings: List[Dict[str, Any]] = drawing_data.get("drawings", [])
     shaded_bars = _extract_shaded_bars(raw_drawings)
+    dark_vertical_edges = _extract_dark_vertical_edges(raw_drawings)
+    dark_horizontal_edges = _extract_dark_horizontal_edges(raw_drawings)
 
     # 计算表格区域（2×2 蔓延算法 + 竖线迭代扩展）
     table_zones = _detect_table_zones(tables, v_lines)
@@ -1279,6 +1574,38 @@ def collect_checkboxes(
             "options": options,
             "additional_text": additional,
         })
+
+    if page_size is not None:
+        for field_idx, field in enumerate(fields):
+            for add_idx, add in enumerate(field.get("additional_text", [])):
+                label_bbox = add.get("label_bbox")
+                fill_rect = add.get("fill_rect")
+                if not label_bbox or not fill_rect:
+                    continue
+                reserved_rects = _collect_reserved_rects(fields, field_idx, add_idx)
+                new_fill = _best_additional_rect(
+                    label_bbox=label_bbox,
+                    page_size=page_size,
+                    merged_lines=merged_lines,
+                    h_lines=h_lines,
+                    reserved_rects=reserved_rects,
+                    v_lines=v_lines,
+                    shaded_bars=shaded_bars,
+                    dark_vertical_edges=dark_vertical_edges,
+                    dark_horizontal_edges=dark_horizontal_edges,
+                )
+                if new_fill is not None:
+                    add["fill_rect"] = new_fill
+
+    for field in fields:
+        for idx, line in enumerate(merged_lines):
+            if idx in consumed_line_ids:
+                continue
+            text = str(line.get("text", "")).strip()
+            if not text:
+                continue
+            if _is_absorbed_suffix_line(text, list(line["bbox"]), field):
+                consumed_line_ids.add(idx)
 
     # 构建 consumed_update
     for idx in consumed_line_ids:

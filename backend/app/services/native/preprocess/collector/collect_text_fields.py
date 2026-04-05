@@ -52,6 +52,14 @@ def _cy(bbox: Tuple[float, ...]) -> float:
     return (bbox[1] + bbox[3]) / 2.0
 
 
+def _bbox_overlap_x(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+    return max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+
+
+def _bbox_overlap_y(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+    return max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+
+
 def _rect_area(r: Optional[List[float]]) -> float:
     if r is None:
         return 0.0
@@ -131,6 +139,42 @@ def _make_static_obstacles(
     return obs
 
 
+def _extract_dark_vertical_edges(drawings: List[Dict[str, Any]]) -> List[Obstacle]:
+    edges: List[Obstacle] = []
+    for d in drawings:
+        fill = d.get("fill")
+        rect = d.get("rect")
+        if fill is None or rect is None:
+            continue
+        if not (isinstance(fill, (list, tuple)) and len(fill) >= 3):
+            continue
+        if sum(float(c) for c in fill[:3]) > 0.25:
+            continue
+        x0, y0, x1, y1 = [float(v) for v in rect]
+        if 0.0 < (x1 - x0) <= 2.0 and (y1 - y0) >= 8.0:
+            edges.append((x0, y0, x1, y1))
+    edges.sort(key=lambda r: (r[0], r[1]))
+    return edges
+
+
+def _extract_dark_horizontal_edges(drawings: List[Dict[str, Any]]) -> List[Obstacle]:
+    edges: List[Obstacle] = []
+    for d in drawings:
+        fill = d.get("fill")
+        rect = d.get("rect")
+        if fill is None or rect is None:
+            continue
+        if not (isinstance(fill, (list, tuple)) and len(fill) >= 3):
+            continue
+        if sum(float(c) for c in fill[:3]) > 0.25:
+            continue
+        x0, y0, x1, y1 = [float(v) for v in rect]
+        if 0.0 < (y1 - y0) <= 2.0 and (x1 - x0) >= 8.0:
+            edges.append((x0, y0, x1, y1))
+    edges.sort(key=lambda r: (r[1], r[0]))
+    return edges
+
+
 def _find_right_bound(
     x: float, y0: float, y1: float, obstacles: List[Obstacle],
 ) -> Optional[float]:
@@ -152,6 +196,49 @@ def _find_bottom_bound(
         if oy0 > y + _TOL and ox0 < x1 - _TOL and ox1 > x0 + _TOL:
             if best is None or oy0 < best:
                 best = oy0
+    return best
+
+
+def _find_vertical_edge(
+    x0: float,
+    y0: float,
+    y1: float,
+    v_lines: List[Dict[str, Any]],
+    dark_vertical_edges: List[Obstacle],
+) -> Optional[float]:
+    best: Optional[float] = None
+    probe = (x0, y0, x0 + 1.0, y1)
+    for vl in v_lines:
+        vx = float(vl.get("x", 0.0))
+        vy0 = float(vl.get("y0", 0.0))
+        vy1 = float(vl.get("y1", 0.0))
+        if vx <= x0 + _TOL:
+            continue
+        if _bbox_overlap_y((vx, vy0, vx + 0.1, vy1), probe) > 1.0:
+            best = vx if best is None else min(best, vx)
+    for ex0, ey0, ex1, ey1 in dark_vertical_edges:
+        if ex0 <= x0 + _TOL:
+            continue
+        if _bbox_overlap_y((ex0, ey0, ex1, ey1), probe) > 1.0:
+            best = ex0 if best is None else min(best, ex0)
+    return best
+
+
+def _find_column_right_edge(
+    bbox: Tuple[float, ...],
+    page_right: float,
+    v_lines: List[Dict[str, Any]],
+    shaded_bars: List[Obstacle],
+    dark_vertical_edges: List[Obstacle],
+) -> float:
+    lx0, ly0, _lx1, ly1 = bbox
+    best = page_right
+    for bx0, _by0, bx1, _by1 in shaded_bars:
+        if bx0 <= lx0 + _TOL and bx1 > lx0 + _TOL:
+            best = min(best, bx1)
+    vertical_edge = _find_vertical_edge(lx0, ly0, ly1, v_lines, dark_vertical_edges)
+    if vertical_edge is not None:
+        best = min(best, vertical_edge)
     return best
 
 
@@ -267,6 +354,8 @@ def collect_text_fields(
 
     table_zones = _detect_table_zones(tables, v_lines)
     shaded_bars = _extract_shaded_bars(raw_drawings)
+    dark_vertical_edges = _extract_dark_vertical_edges(raw_drawings)
+    dark_horizontal_edges = _extract_dark_horizontal_edges(raw_drawings)
     cb_zones = _build_checkbox_zones(checkbox_fields)
 
     # ==================================================================
@@ -297,6 +386,8 @@ def collect_text_fields(
 
     # 静态障碍物（矢量线 + 背景条 + checkbox 禁区）
     static_obs = _make_static_obstacles(h_lines, v_lines, shaded_bars, cb_zones)
+    static_obs.extend(dark_vertical_edges)
+    static_obs.extend(dark_horizontal_edges)
 
     fields: List[Dict[str, Any]] = []
     new_consumed: Set[str] = set()
@@ -482,6 +573,101 @@ def collect_text_fields(
                 "fill_rect": fr,
             })
             new_consumed.add(f"line:{idx}")
+
+    # ==================================================================
+    # Separator-Aware Allowed Region Refinement
+    # ==================================================================
+    field_labels = [
+        (fi, tuple(field["label_bbox"]))
+        for fi, field in enumerate(fields)
+        if field.get("label_bbox")
+    ]
+    field_rows = _group_by_row(list(range(len(field_labels))), lambda li: field_labels[li][1])
+    field_row_y_tops = [min(field_labels[li][1][1] for li in row) for row in field_rows]
+    field_row_of: Dict[int, Tuple[int, int]] = {}
+    for ri, row in enumerate(field_rows):
+        for pos, li in enumerate(row):
+            field_row_of[li] = (ri, pos)
+
+    field_column_rights: Dict[int, float] = {}
+    for fi, bbox in field_labels:
+        field_column_rights[fi] = _find_column_right_edge(
+            bbox=bbox,
+            page_right=page_right,
+            v_lines=v_lines,
+            shaded_bars=shaded_bars,
+            dark_vertical_edges=dark_vertical_edges,
+        )
+
+    def _full_obstacles_for_bbox(label_bbox: Tuple[float, ...]) -> List[Obstacle]:
+        obs = list(static_obs)
+        for b in all_text_bboxes.values():
+            same = all(abs(b[i] - label_bbox[i]) <= 0.5 for i in range(4))
+            if not same:
+                obs.append(b)
+        return obs
+
+    for fi, field in enumerate(fields):
+        lb = field.get("label_bbox")
+        if not lb:
+            continue
+        bbox = tuple(float(v) for v in lb)
+        lx0, ly0, lx1, ly1 = bbox
+        lh = ly1 - ly0
+        if lh <= 0:
+            continue
+
+        ri, pos = field_row_of.get(fi, (0, 0))
+        row = field_rows[ri]
+        next_x0 = field_labels[row[pos + 1]][1][0] if pos + 1 < len(row) else page_right
+        column_right = field_column_rights[fi]
+
+        def _next_value_y(cx0: float, cx1: float) -> float:
+            best = page_bottom
+            probe = (cx0, ly1, cx1, ly1 + 1.0)
+            for oi, obox in field_labels:
+                if oi == fi:
+                    continue
+                if obox[1] <= ly1 + _TOL:
+                    continue
+                other_col_right = field_column_rights[oi]
+                other_value_band = (obox[2], obox[1], other_col_right, obox[3])
+                if _bbox_overlap_x(probe, other_value_band) > 1.0:
+                    best = min(best, obox[1])
+            if best == page_bottom and ri + 1 < len(field_rows):
+                best = field_row_y_tops[ri + 1]
+            return best
+
+        obs = _full_obstacles_for_bbox(bbox)
+
+        rb = _find_right_bound(lx1, ly0, ly1, obs) or page_right
+        rb = min(rb, next_x0)
+        bb_r = _find_bottom_bound(ly1, lx1, rb, obs) or ly1
+        bb_r = min(bb_r, _next_value_y(lx1, rb))
+        right_rect: Optional[List[float]] = None
+        if rb - lx1 > _TOL and bb_r - ly0 > _TOL:
+            right_rect = _shrink_rect_no_overlap([lx1, ly0, rb, bb_r], obs)
+            if right_rect and right_rect[1] < ly0:
+                right_rect[1] = ly0
+
+        rb_b = _find_right_bound(lx0, ly1, ly1 + 1, obs) or page_right
+        rb_b = min(rb_b, column_right)
+        rb_b = min(rb_b, next_x0)
+        bb_b = _find_bottom_bound(ly1, lx0, rb_b, obs) or (ly1 + lh)
+        bb_b = min(bb_b, _next_value_y(lx0, rb_b))
+        bb_b = min(bb_b, ly1 + lh * _BELOW_MAX_H_RATIO)
+        below_rect: Optional[List[float]] = None
+        if rb_b - lx0 > _TOL and bb_b - ly1 > _TOL:
+            below_rect = _shrink_rect_no_overlap([lx0, ly1, rb_b, bb_b], obs)
+            if below_rect and below_rect[0] != lx0:
+                below_rect[0] = lx0
+
+        if right_rect and below_rect:
+            fr = below_rect if _rect_area(below_rect) >= _rect_area(right_rect) else right_rect
+        else:
+            fr = below_rect or right_rect
+
+        field["fill_rect"] = fr
 
     # ==================================================================
     # 冲突消解
