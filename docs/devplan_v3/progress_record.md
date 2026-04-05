@@ -310,3 +310,62 @@ Phase 2B 仍有两个 PDF 存在残留的重叠问题。001 号 PDF（FDIC f3700
 - `collector/collect_checkboxes.py`：checkbox 专属几何与归属逻辑
 - `collector/collect_text_fields.py`：text field 专属几何与归属逻辑
 - `core/odl_fallback.py`：两者共享的 ODL fallback 信号、raw loader 与 label completion helper
+
+---
+
+## 八、Text Rect Generation 重构落地（2026-04-05）
+
+本轮对 `backend/app/services/native/preprocess/collector/collect_text_fields.py` 做了一次局部重构，目标是把 text field 的 `right_rect / below_rect` 生成逻辑从 “大候选框 + shrink 回收” 改成更直接的 obstacle-aware candidate construction。
+
+### 8.1 改动边界
+
+本次只修改 text field 路径：
+
+- `Channel 3: Remaining`
+- `Separator-Aware Allowed Region Refinement`
+
+未改动：
+
+- Phase 1 merge
+- ODL fallback 行为
+- checkbox 收集逻辑
+
+### 8.2 新的 rect 生成方式
+
+- `below_rect`
+  - 从 `label.x0` 出发
+  - 先用窄探针向下找最近底边
+  - 再在该高度内向右找最近右边界
+  - 直接生成合法候选，不再先铺大框再 shrink
+
+- `right_rect`
+  - 以接近 label 等高的条形候选为基线
+  - 允许少量上下微调和轻微降高
+  - 如果简单变体都不理想，就让 `below_rect` 自然胜出
+
+- 候选选择
+  - 直接比较合法 `right_rect` / `below_rect` 的实际面积
+  - 面积相等时 `right_rect` 优先
+
+### 8.3 collision 兜底同步收紧
+
+末尾的全局 collision 兜底从只避开其它 `fill_rect`，扩大为同时避开：
+
+- 其它 field 的 `fill_rect`
+- 其它 field 的 `label_bbox`
+
+### 8.4 本轮验证
+
+- `PYTHONPATH=backend ./venv/bin/python TestSpace/preprocess_test_v3/test_text_fields.py --pdf 013 --json`
+- `PYTHONPATH=backend ./venv/bin/python TestSpace/preprocess_test_v3/test_text_fields.py --batch`
+- `SMARTFILL_ODL_FALLBACK_RAW_DIR=... PYTHONPATH=backend ./venv/bin/python TestSpace/preprocess_test_v3/test_text_fields.py --pdf 008 --json`
+
+关键结果：
+
+- `013 p1 T7 (1. Individual’s Name)` 不再覆盖 `T8 (Last First)`
+- 启用 ODL fallback 时，`008 p2` 第 15 题长 label 仍保持完整
+- 当前批量几何自检下，`001 / 008 / 013 / 018 / 019` 的 text `fill_rect -> other label_bbox` 重叠为 `0`
+
+残留：
+
+- `004 p9` 免责声明密集区仍有 2 处 text `fill_rect -> other label_bbox` 重叠，后续还需要单独处理

@@ -197,6 +197,121 @@
 | `text separator-aware allowed region`：每个 text label 的 rect 只能落在自己的允许区域里；允许区域同时受矢量线、表格边框、横向阴影条、竖向黑色填充条、同行下一个 label 的 `x0`、同列下一个 label 的 `y0` 共同约束 | `/tmp/text_rect_separator_experiment.py`、`/tmp/text_rect_separator_experiment/004_p1_separator_aware_text_rects.json`。最早用于修复 `004 p1 T5` 跑到右栏的问题。 | **已迁移** | 已迁移到 `backend/app/services/native/preprocess/collector/collect_text_fields.py`，包括 `_extract_dark_vertical_edges`、`_extract_dark_horizontal_edges`、`_find_vertical_edge`、`_find_column_right_edge`，以及 `Separator-Aware Allowed Region Refinement` 主逻辑。 |
 | `text rect collision resolution`：在 allowed-region 之后继续复用正式代码的两步碰撞消解（同行裁剪 + 全局 shrink） | `/tmp/text_rect_separator_experiment.py` 与 batch 结果 `/tmp/text_rect_separator_experiment/batch_text_20260405T101611Z/summary.json`。该轮实验把 batch overlap 从 `26` 压到 `1`。 | **已迁移** | 主代码 `collect_text_fields.py` 末尾已保留并继续使用这两步冲突消解。 |
 
+## 待实现草案：text field rect generation 改为 obstacle-aware candidate construction（2026-04-05）
+
+本节记录一条新的重构思路。它不是当前主代码的行为，而是后续可以替换 `Phase 2B` 里 “先生成大候选 rect，再用 shrink 回收” 逻辑的候选方案。
+
+### 背景
+
+当前 `collect_text_fields.py` 在 `right_rect` / `below_rect` 路径里，依赖 `_shrink_rect_no_overlap()` 对大候选区域做事后裁剪。`013 p1 T7` 这类 case 暴露出一个结构性问题：
+
+- `shrink` 后的 `right_rect` / `below_rect` 其实都可能已经是安全区域
+- 但后续仍可能发生额外的几何改写（例如 `below_rect` 再被左对齐扩张）
+- 最终面积比较使用的并不一定是“真实可用区域”
+
+因此，新的方向应当是：
+
+- 直接按障碍物生成合法候选 rect
+- 只比较合法候选的实际面积
+- 尽量不再依赖后置 `shrink`
+
+### 草案目标
+
+把 text field 的 rect 生成改成：
+
+1. 先生成 `below_rect`
+2. 再生成 `right_rect`
+3. 直接比较两者的实际面积
+4. 面积更大者胜
+5. 不再先铺一个明显越界的大框，再靠 shrink 回收
+
+### `below_rect` 草案
+
+`below_rect` 的构造顺序应当是：
+
+1. 以 `label.x0` 作为左起点
+2. 先向下搜索，找到最近有效底边
+3. 再在这个高度范围内向右搜索，找到最近有效右边界
+4. 用这两个边界直接生成合法 `below_rect`
+
+这里“有效边界 / 障碍物”应直接复用现有 `collect_text_fields.py` 已经在使用的障碍体系，包括但不限于：
+
+- `horizontal_lines`
+- `vertical_lines`
+- `shaded_bars`
+- `dark_vertical_edges`
+- `dark_horizontal_edges`
+- `checkbox zones`
+- 其它 `label_bbox`
+- 其它 field 的 `fill_rect`
+- 页面已有文字 bbox
+
+直觉上，`below_rect` 是一个列内区域，因此：
+
+- 高度应由“向下先遇到的障碍”主导
+- 宽度应由“在该高度范围内向右先遇到的障碍”主导
+
+### `right_rect` 草案
+
+`right_rect` 的构造思路应更保守一些：
+
+1. 默认先以“与 label 近似等高”的条形区域作为基线候选
+2. 从 `label.x1` 向右扫描，找到最近有效右边界
+3. 如果在当前高度下过早撞到障碍，允许做少量简单尝试
+
+这些简单尝试不应设计得过于复杂，最多可包括：
+
+- 轻微下移
+- 轻微上移
+- 轻微缩小高度
+
+如果这些简单变体仍然找不到一个面积足够合理的 `right_rect`，则可以直接放弃右侧候选，让 `below_rect` 自然胜出。
+
+### 面积比较草案
+
+在新方案下，面积比较应当满足：
+
+- 只比较“最终合法候选”的实际面积
+- 不比较 shrink 前的理论面积
+- 不在候选生成后再做会改写几何含义的额外扩张
+
+如果两者面积接近或完全相等，当前讨论倾向于：
+
+- `right_rect` 优先
+
+### 设计原则
+
+这条草案的核心不是引入更复杂的优化器，而是把逻辑变得更直接：
+
+- 先按障碍物长出合法区域
+- 再比较合法区域面积
+- 不再依赖 “大框 -> shrink -> 再修形” 的多阶段补救
+
+当前判断：
+
+- 这条方案在设计上比现有 shrink-heavy 方案更自然
+- 它复用了现有障碍物定义，不需要重建障碍体系
+- 它属于 `text field rect generation` 的重构，不是一个局部小修
+
+### 2026-04-05 实施状态补充
+
+上述草案已部分落入当前主代码 `backend/app/services/native/preprocess/collector/collect_text_fields.py`，范围只覆盖 text field 的 `Channel 3` 和 `Separator-Aware Allowed Region Refinement`：
+
+- `below_rect`：改为从 `label.x0` 出发，先用窄探针向下找底边，再在该高度内向右找右边界，直接生成合法候选
+- `right_rect`：改为以接近 label 等高的条形候选为基线，只做少量上下微调与轻微降高尝试，不再先铺大框再 shrink
+- 候选选择：改为直接比较合法 `right_rect` / `below_rect` 的实际面积；面积相等时 `right_rect` 优先
+- 全局 collision 兜底：从“只避开其它 `fill_rect`”扩大为“同时避开其它 field 的 `fill_rect` 与 `label_bbox`”
+
+本轮验证结果：
+
+- `013 p1 T7 (1. Individual’s Name)` 已不再覆盖 `T8 (Last First)`
+- 启用 `SMARTFILL_ODL_FALLBACK_RAW_DIR` 后，`008 p2` 第 15 题长 label 仍保持完整
+- 当前批量几何自检下，`001 / 008 / 013 / 018 / 019` 的 text `fill_rect -> other label_bbox` 重叠为 `0`
+
+仍有残留：
+
+- `004 p9` 免责声明密集文字区仍剩 2 处 `fill_rect -> other label_bbox` 重叠，说明这套新逻辑已经修正主问题，但尚未完全覆盖所有极端密集排版
+
 ## 当前主代码与历史状态补充
 
 - 当前 `git log` 中与本轮相关的最近提交可见：

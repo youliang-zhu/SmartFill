@@ -70,6 +70,35 @@ def _rect_area(r: Optional[List[float]]) -> float:
     return max(0.0, r[2] - r[0]) * max(0.0, r[3] - r[1])
 
 
+def _rect_overlaps(a: Tuple[float, ...], b: Tuple[float, ...]) -> bool:
+    return _bbox_overlap_x(a, b) > _TOL and _bbox_overlap_y(a, b) > _TOL
+
+
+def _rect_overlaps_any(rect: List[float], obstacles: List[Obstacle]) -> bool:
+    probe = (rect[0], rect[1], rect[2], rect[3])
+    for obs in obstacles:
+        if _rect_overlaps(probe, obs):
+            return True
+    return False
+
+
+def _normalize_rect(rect: List[float]) -> Optional[List[float]]:
+    if rect[2] - rect[0] <= _TOL or rect[3] - rect[1] <= _TOL:
+        return None
+    return rect
+
+
+def _choose_larger_rect(
+    right_rect: Optional[List[float]],
+    below_rect: Optional[List[float]],
+) -> Optional[List[float]]:
+    if right_rect and below_rect:
+        if _rect_area(right_rect) >= _rect_area(below_rect):
+            return right_rect
+        return below_rect
+    return right_rect or below_rect
+
+
 def _is_noise(text: str) -> bool:
     s = text.strip()
     if len(s) <= 2:
@@ -313,6 +342,88 @@ def _shrink_rect_no_overlap(
     return [rx0, ry0, rx1, ry1]
 
 
+def _build_below_rect(
+    *,
+    lx0: float,
+    ly1: float,
+    right_limit: float,
+    bottom_limit: float,
+    obstacles: List[Obstacle],
+) -> Optional[List[float]]:
+    """直接按障碍物生成下方候选，不再先铺大框后 shrink。"""
+    if right_limit - lx0 <= _TOL or bottom_limit - ly1 <= _TOL:
+        return None
+
+    probe_right = min(right_limit, lx0 + 1.0)
+    if probe_right - lx0 <= _TOL:
+        return None
+
+    bottom = _find_bottom_bound(ly1, lx0, probe_right, obstacles) or bottom_limit
+    bottom = min(bottom, bottom_limit)
+    if bottom - ly1 <= _TOL:
+        return None
+
+    right = _find_right_bound(lx0, ly1, bottom, obstacles) or right_limit
+    right = min(right, right_limit)
+    rect = _normalize_rect([lx0, ly1, right, bottom])
+    if rect is None or _rect_overlaps_any(rect, obstacles):
+        return None
+    return rect
+
+
+def _build_right_rect(
+    *,
+    lx1: float,
+    ly0: float,
+    ly1: float,
+    right_limit: float,
+    top_limit: float,
+    bottom_limit: float,
+    obstacles: List[Obstacle],
+) -> Optional[List[float]]:
+    """构造右侧候选：等高优先，少量上下微调/降高。"""
+    if right_limit - lx1 <= _TOL:
+        return None
+
+    lh = ly1 - ly0
+    if lh <= _TOL:
+        return None
+
+    shift = lh * 0.3
+    trim = lh * 0.18
+    variants = [
+        (ly0, ly1),
+        (ly0 + shift, ly1 + shift),
+        (ly0 - shift, ly1 - shift),
+        (ly0 + trim, ly1 - trim),
+        (ly0 + shift, ly1 - trim),
+    ]
+
+    best: Optional[List[float]] = None
+    best_area = 0.0
+    seen: Set[Tuple[float, float]] = set()
+    for y0, y1 in variants:
+        y0 = max(top_limit, y0)
+        y1 = min(bottom_limit, y1)
+        key = (round(y0, 2), round(y1, 2))
+        if key in seen or y1 - y0 <= _TOL:
+            continue
+        seen.add(key)
+
+        right = _find_right_bound(lx1, y0, y1, obstacles) or right_limit
+        right = min(right, right_limit)
+        rect = _normalize_rect([lx1, y0, right, y1])
+        if rect is None or _rect_overlaps_any(rect, obstacles):
+            continue
+
+        area = _rect_area(rect)
+        if area > best_area:
+            best = rect
+            best_area = area
+
+    return best
+
+
 # ---------------------------------------------------------------------------
 # 行分组
 # ---------------------------------------------------------------------------
@@ -541,56 +652,32 @@ def collect_text_fields(
             obs = _full_obstacles(idx)
 
             # --- 右侧候选 ---
-            # Fix #1/#3: right_rect top 不能高于 label top
-            rb = _find_right_bound(lx1, ly0, ly1, obs) or page_right
-            rb = min(rb, next_x0)
-            bb_r = _find_bottom_bound(ly1, lx1, rb, obs) or ly1
-
-            right_rect: Optional[List[float]] = None
-            if rb - lx1 > _TOL and bb_r - ly0 > _TOL:
-                right_rect = _shrink_rect_no_overlap([lx1, ly0, rb, bb_r], obs)
-                # 再次确保 shrink 没把 top 推到 label 上方
-                if right_rect and right_rect[1] < ly0:
-                    right_rect[1] = ly0
+            right_limit = next_x0
+            right_rect = _build_right_rect(
+                lx1=lx1,
+                ly0=ly0,
+                ly1=ly1,
+                right_limit=right_limit,
+                top_limit=max(0.0, ly0 - lh * 0.4),
+                bottom_limit=min(next_row_y, page_bottom),
+                obstacles=obs,
+            )
 
             # --- 下方候选 ---
-            # Fix #2: 阴影右边缘优先作为列边界
             shaded_edge = _find_shaded_right_edge(lx0)
-            rb_b = _find_right_bound(lx0, ly1, ly1 + 1, obs) or page_right
+            below_limit = next_x0
             if shaded_edge is not None:
-                rb_b = min(rb_b, shaded_edge)
-            rb_b = min(rb_b, next_x0)              # 不超过同行下一个 label
-            bb_b = _find_bottom_bound(ly1, lx0, rb_b, obs) or (ly1 + lh)
-            bb_b = min(bb_b, ly1 + lh * _BELOW_MAX_H_RATIO)  # 高度上限
-            bb_b = min(bb_b, next_row_y)                       # 不侵入下一行
+                below_limit = min(below_limit, shaded_edge)
+            below_rect = _build_below_rect(
+                lx0=lx0,
+                ly1=ly1,
+                right_limit=below_limit,
+                bottom_limit=min(next_row_y, ly1 + lh * _BELOW_MAX_H_RATIO, page_bottom),
+                obstacles=obs,
+            )
 
-            below_rect: Optional[List[float]] = None
-            if rb_b - lx0 > _TOL and bb_b - ly1 > _TOL:
-                below_rect = _shrink_rect_no_overlap([lx0, ly1, rb_b, bb_b], obs)
-
-            # Fix #4: below_rect 左侧钉死对齐 label x0
-            if below_rect and below_rect[0] != lx0:
-                below_rect[0] = lx0
-
-            # 面积优先
-            is_below = False
-            if right_rect and below_rect:
-                if _rect_area(below_rect) >= _rect_area(right_rect):
-                    fr = below_rect
-                    is_below = True
-                else:
-                    fr = right_rect
-            elif below_rect:
-                fr = below_rect
-                is_below = True
-            elif right_rect:
-                fr = right_rect
-            else:
-                fr = None
-
-            # Fix #4: 选定 below 后再次确保左对齐
-            if is_below and fr is not None and fr[0] != lx0:
-                fr[0] = lx0
+            # 面积优先；相等时优先右侧
+            fr = _choose_larger_rect(right_rect, below_rect)
 
             fields.append({
                 "field_type": "text",
@@ -710,32 +797,25 @@ def collect_text_fields(
 
         obs = _full_obstacles_for_bbox(bbox)
 
-        rb = _find_right_bound(lx1, ly0, ly1, obs) or page_right
-        rb = min(rb, next_x0)
-        bb_r = _find_bottom_bound(ly1, lx1, rb, obs) or ly1
-        bb_r = min(bb_r, _next_value_y(lx1, rb))
-        right_rect: Optional[List[float]] = None
-        if rb - lx1 > _TOL and bb_r - ly0 > _TOL:
-            right_rect = _shrink_rect_no_overlap([lx1, ly0, rb, bb_r], obs)
-            if right_rect and right_rect[1] < ly0:
-                right_rect[1] = ly0
+        right_rect = _build_right_rect(
+            lx1=lx1,
+            ly0=ly0,
+            ly1=ly1,
+            right_limit=min(next_x0, page_right),
+            top_limit=max(0.0, ly0 - lh * 0.4),
+            bottom_limit=min(_next_value_y(lx1, next_x0), page_bottom),
+            obstacles=obs,
+        )
 
-        rb_b = _find_right_bound(lx0, ly1, ly1 + 1, obs) or page_right
-        rb_b = min(rb_b, column_right)
-        rb_b = min(rb_b, next_x0)
-        bb_b = _find_bottom_bound(ly1, lx0, rb_b, obs) or (ly1 + lh)
-        bb_b = min(bb_b, _next_value_y(lx0, rb_b))
-        bb_b = min(bb_b, ly1 + lh * _BELOW_MAX_H_RATIO)
-        below_rect: Optional[List[float]] = None
-        if rb_b - lx0 > _TOL and bb_b - ly1 > _TOL:
-            below_rect = _shrink_rect_no_overlap([lx0, ly1, rb_b, bb_b], obs)
-            if below_rect and below_rect[0] != lx0:
-                below_rect[0] = lx0
+        below_rect = _build_below_rect(
+            lx0=lx0,
+            ly1=ly1,
+            right_limit=min(column_right, next_x0),
+            bottom_limit=min(_next_value_y(lx0, min(column_right, next_x0)), ly1 + lh * _BELOW_MAX_H_RATIO, page_bottom),
+            obstacles=obs,
+        )
 
-        if right_rect and below_rect:
-            fr = below_rect if _rect_area(below_rect) >= _rect_area(right_rect) else right_rect
-        else:
-            fr = below_rect or right_rect
+        fr = _choose_larger_rect(right_rect, below_rect)
 
         field["fill_rect"] = fr
 
@@ -761,7 +841,7 @@ def collect_text_fields(
                 if fr[2] <= fr[0] + _TOL:
                     fields[fi]["fill_rect"] = None
 
-    # Step 2: 全局兜底 — 各 field 的 fill_rect 不应与其它 fill_rect 重叠
+    # Step 2: 全局兜底 — 各 field 的 fill_rect 不应与其它 fill_rect / label_bbox 重叠
     sorted_fi = sorted(
         range(len(fields)),
         key=lambda i: (_cy(tuple(fields[i]["label_bbox"])), fields[i]["label_bbox"][0]),
@@ -777,6 +857,9 @@ def collect_text_fields(
             ofr = fields[fj]["fill_rect"]
             if ofr is not None:
                 other_rects.append((ofr[0], ofr[1], ofr[2], ofr[3]))
+            olb = fields[fj].get("label_bbox")
+            if olb is not None:
+                other_rects.append((olb[0], olb[1], olb[2], olb[3]))
         if other_rects:
             fields[fi]["fill_rect"] = _shrink_rect_no_overlap(fr, other_rects)
 
