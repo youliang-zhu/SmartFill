@@ -14,13 +14,13 @@
 
 from __future__ import annotations
 
-import json
-import os
 import re
-from functools import lru_cache
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from app.services.native.preprocess.core.odl_fallback import (
+    _find_odl_label_completion,
+    _load_odl_fallback_lines,
+)
 from app.services.native.preprocess.core.types import RectTuple
 
 
@@ -40,7 +40,6 @@ _GROUP_GAP_X = 300.0           # 同行 checkbox 间的 x 最大间距
 _HORIZ_LABEL_Y_TOL = 10.0       # _merge_same_row 同行判断的 y 容差
 _MAX_CELL_HEIGHT = 80.0          # 封闭单元格最大高度（超过视为页面区域而非表单单元格）
 _SHADED_BAR_MIN_WIDTH = 200.0    # 最小宽度才视为"分节标题栏"
-_ODL_TEXT_TYPES = {"paragraph", "heading", "caption", "list item", "text block"}
 _ODL_OPTION_TEXTS = {"yes", "no", "true", "false", "si", "sí"}
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _IF_PREFIX_RE = re.compile(r"^\s*[\(\[]?\s*if\s+(?:yes|no|true|false)\b", re.I)
@@ -215,87 +214,6 @@ def _starts_with_checkbox(text: str) -> bool:
     if not stripped:
         return False
     return _is_checkbox_char(stripped[0])
-
-
-def _iter_odl_elements(node: Any) -> List[Dict[str, Any]]:
-    found: List[Dict[str, Any]] = []
-    if isinstance(node, dict):
-        if all(k in node for k in ("type", "page number", "bounding box")):
-            bbox = node.get("bounding box")
-            if isinstance(bbox, list) and len(bbox) == 4:
-                found.append(
-                    {
-                        "type": str(node.get("type", "")),
-                        "page_num": int(node.get("page number", 0)),
-                        "bbox": tuple(float(v) for v in bbox),
-                        "content": str(node.get("content", "") or "").strip(),
-                    }
-                )
-        for value in node.values():
-            found.extend(_iter_odl_elements(value))
-    elif isinstance(node, list):
-        for item in node:
-            found.extend(_iter_odl_elements(item))
-    return found
-
-
-def _pdf_to_top_origin_bbox(pdf_bbox: Tuple[float, float, float, float], page_height: float) -> List[float]:
-    x0, y_bottom, x1, y_top = pdf_bbox
-    return [
-        round(x0, 2),
-        round(page_height - y_top, 2),
-        round(x1, 2),
-        round(page_height - y_bottom, 2),
-    ]
-
-
-@lru_cache(maxsize=128)
-def _load_odl_text_lines_cached(raw_json_path: str, page_num: int, page_height: float) -> Tuple[Tuple[str, Tuple[float, float, float, float]], ...]:
-    path = Path(raw_json_path)
-    if not path.exists():
-        return tuple()
-    with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    seen: Set[Tuple[str, Tuple[float, float, float, float]]] = set()
-    rows: List[Tuple[str, Tuple[float, float, float, float]]] = []
-    for elem in _iter_odl_elements(raw.get("kids", [])):
-        if elem["page_num"] != page_num or elem["type"] not in _ODL_TEXT_TYPES:
-            continue
-        text = elem["content"].strip()
-        if not text:
-            continue
-        bbox = tuple(_pdf_to_top_origin_bbox(elem["bbox"], page_height))
-        key = (text, bbox)
-        if key in seen:
-            continue
-        seen.add(key)
-        rows.append(key)
-    rows.sort(key=lambda item: (item[1][1], item[1][0]))
-    return tuple(rows)
-
-
-def _load_odl_text_lines(
-    pdf_path: str,
-    page_num: int,
-    page_size: RectTuple | None,
-) -> List[Dict[str, Any]]:
-    raw_dir = os.environ.get("SMARTFILL_ODL_CHECKBOX_RAW_DIR", "").strip()
-    if not raw_dir or not pdf_path or page_size is None:
-        return []
-    raw_json = Path(raw_dir) / f"{Path(pdf_path).stem}.json"
-    page_height = float(page_size[3] - page_size[1])
-    rows = _load_odl_text_lines_cached(str(raw_json), page_num, page_height)
-    return [
-        {
-            "text": text,
-            "bbox": list(bbox),
-            "font_size": 10.0,
-            "page_num": page_num,
-            "source": "odl",
-        }
-        for text, bbox in rows
-    ]
 
 
 def _filter_odl_label_lines(
@@ -484,44 +402,13 @@ def _find_odl_completion_candidate(
     odl_lines: List[Dict[str, Any]],
     allow_shorter: bool = False,
 ) -> Tuple[str, Optional[RectTuple]]:
-    baseline_label = _normalize_text(baseline_label)
-    if not baseline_label or baseline_bbox is None:
-        return "", None
-    baseline_core = _strip_enum_prefix(_strip_trailing_option_tail(baseline_label))
-    baseline_tokens = _token_set(baseline_core)
-    if not baseline_tokens:
-        return "", None
-
-    best: Optional[Tuple[float, str, RectTuple]] = None
-    for line in _filter_odl_label_lines(odl_lines, group_bbox):
-        text = _normalize_text(str(line.get("text", "")))
-        if not text or _looks_like_option_text(text) or _is_polluted_label(text) or _IF_PREFIX_RE.match(text):
-            continue
-        bbox = tuple(line.get("bbox", []))
-        if len(bbox) != 4:
-            continue
-        cand_tokens = _token_set(_strip_enum_prefix(text))
-        overlap = len(baseline_tokens & cand_tokens) / max(1, len(baseline_tokens))
-        if overlap < 0.8:
-            continue
-        if abs(float(bbox[0]) - float(baseline_bbox[0])) > 18:
-            continue
-        if float(bbox[1]) > float(baseline_bbox[1]) + 8:
-            continue
-        if float(bbox[2]) < float(baseline_bbox[2]) - 20:
-            continue
-        if not allow_shorter and len(text) < len(baseline_label) + 8:
-            continue
-        score = overlap * 1000.0 + len(text)
-        if best is None or score > best[0]:
-            best = (score, text, bbox)
-    if best is None:
-        return "", None
-    prefixed = best[1]
-    prefix = _enum_prefix(baseline_label)
-    if prefix and not _enum_prefix(prefixed):
-        prefixed = f"{prefix} {prefixed}"
-    return prefixed, best[2]
+    return _find_odl_label_completion(
+        baseline_label=baseline_label,
+        baseline_bbox=baseline_bbox,
+        odl_lines=_filter_odl_label_lines(odl_lines, group_bbox),
+        allow_shorter=allow_shorter,
+        allow_if_prefix=False,
+    )
 
 
 def _collect_reserved_rects(
@@ -1478,7 +1365,11 @@ def collect_checkboxes(
 
     fields: List[Dict[str, Any]] = []
     consumed_line_ids: Set[int] = set()
-    odl_lines = _load_odl_text_lines(pdf_path=pdf_path, page_num=int(phase1_data.get("page_num", 0)), page_size=page_size)
+    odl_lines = _load_odl_fallback_lines(
+        pdf_path=pdf_path,
+        page_num=int(phase1_data.get("page_num", 0)),
+        page_size=page_size,
+    )
     # 先标记纯 checkbox 字形行为已消耗
     for idx, line in enumerate(merged_lines):
         if _is_checkbox_text(line.get("text", "")):
@@ -1559,6 +1450,22 @@ def collect_checkboxes(
                     q_bbox = odl_q_bbox
                 if _options_need_repair(options) and any(_normalize_text(opt.get("text", "")) for opt in odl_row_options):
                     options = odl_row_options
+
+            for add in additional:
+                add_label = str(add.get("label", "")).strip()
+                add_bbox = add.get("label_bbox")
+                if not add_label or add_bbox is None:
+                    continue
+                odl_add_label, odl_add_bbox = _find_odl_label_completion(
+                    baseline_label=add_label,
+                    baseline_bbox=add_bbox,
+                    odl_lines=odl_lines,
+                    allow_shorter=False,
+                    allow_if_prefix=True,
+                )
+                if odl_add_label and odl_add_bbox is not None:
+                    add["label"] = odl_add_label
+                    add["label_bbox"] = list(odl_add_bbox)
 
         # 组的外包围框（仅 checkbox + options，不含 label）
         fill_rect = group_bbox

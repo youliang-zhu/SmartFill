@@ -257,3 +257,56 @@ Phase 2B 仍有两个 PDF 存在残留的重叠问题。001 号 PDF（FDIC f3700
 ### 6.3 代码结构重组
 
 在 Phase 2 实现完成后，对 preprocess 目录做了一次整理。原先 `types.py`、`utils.py`、`extraction.py`、`label_first.py` 四个文件直接散落在 `preprocess/` 根目录下，与 `detector.py` 和 `__init__.py` 混在一起显得杂乱。这次把这四个内部实现文件统一移入新建的 `core/` 子目录，`collector/` 子目录保持不变，根目录只保留 `detector.py`（对外暴露 `NativeDetector`）和 `__init__.py`（包接口）两个面向外部的文件。所有内部 import 路径同步更新，TestSpace 里引用 `preprocess.types` 旧路径的 4 处测试文件也一并修正。重组后跑全套测试（`test_phase1`、`test_checkboxes`、`test_text_fields`、`test_phases_v3`）均通过，无新增 bug。
+
+---
+
+## 七、ODL_FALLBACK 统一语义（2026-04-05）
+
+本轮 debug 后，ODL 在 preprocess 里的定位被进一步收敛并统一命名。
+
+之前代码与实验记录里的表述容易让人误解为 “ODL 只是 checkbox 的 fallback”。这个说法已经不准确。当前更合理的抽象是：
+
+- `ODL_FALLBACK` 是 preprocess 级别的 **文本补全信号**
+- 它只参与 `label completion`
+- 它不参与几何真值判断
+
+### 7.1 当前覆盖范围
+
+- `checkbox label`
+- `checkbox additional_text.label`
+- `text field label`
+
+### 7.2 当前明确不覆盖的范围
+
+- `fill_rect` 边界选择
+- table / pseudo-table 结构判断
+- Phase 1 的 `split`、`separator detection`、`continuation merge` 主规则
+
+### 7.3 代码入口变化
+
+当前主代码统一使用环境变量：
+
+`SMARTFILL_ODL_FALLBACK_RAW_DIR`
+
+它表示：
+
+- 如果设置了该目录，preprocess 允许读取对应 PDF 的 ODL raw JSON
+- 然后只在 label completion 场景里用 ODL 候选去补全 native 结果
+
+这样做的原因是：
+
+- PyMuPDF / native preprocess 仍然是几何真源
+- ODL 提供的是更强的段落级文本聚合能力
+- 两者的合理分工应当是 “native 定几何，ODL 补文本”，而不是让 ODL 接管所有判断
+
+### 7.4 共享模块归位
+
+为避免 `collect_text_fields.py` 继续从 `collect_checkboxes.py` 借用 ODL loader / completion helper，这些 preprocess 级共用能力已整理到：
+
+`backend/app/services/native/preprocess/core/odl_fallback.py`
+
+这样当前结构上的语义是明确的：
+
+- `collector/collect_checkboxes.py`：checkbox 专属几何与归属逻辑
+- `collector/collect_text_fields.py`：text field 专属几何与归属逻辑
+- `core/odl_fallback.py`：两者共享的 ODL fallback 信号、raw loader 与 label completion helper

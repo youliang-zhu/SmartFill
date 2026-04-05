@@ -216,6 +216,20 @@
 2. 评估是否要把 ODL raw dir 配置前移到统一测试入口
 - 当前 `text_fields` 侧对 checkbox 的 ODL 增强依赖环境变量；如果测试时不带该变量，会看到 baseline 行为。
 
+3. `ODL_FALLBACK` 语义统一（2026-04-05）
+- 当前主代码已不再把 ODL 视为 “checkbox 专属 fallback”。
+- `ODL_FALLBACK` 的语义是：当 native preprocess 的程序化文本分组不完整时，允许用 ODL 的段落/文本块结果做 **label completion**。
+- 该信号当前覆盖：
+  - `checkbox label`
+  - `checkbox additional_text.label`
+  - `text field label`
+- 该信号当前**不**覆盖：
+  - `fill_rect` 边界几何
+  - table/grid 结构判定
+  - Phase 1 的 split / separator / continuation merge 主逻辑
+- 当前统一入口环境变量为 `SMARTFILL_ODL_FALLBACK_RAW_DIR`。
+- 这样做的原因是：ODL 在本项目中属于“文本补全信号”，不是“几何真值信号”。
+
 ## 附录：当前必须考虑的分隔情况（2026-04-05）
 
 当前 preprocess 在做 `merge`、`split`、`fill_rect` 选边界时，至少应把下面这些情况视为“硬分隔”或“优先级很高的分隔信号”：
