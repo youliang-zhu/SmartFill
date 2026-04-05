@@ -22,6 +22,27 @@
 - **已做改动**：将 `backend/app/services/native/preprocess/core/extraction.py` 中 Phase 1.6 `_merge_left_right` 的短片段阈值从 `10` 提高到 `15`。
 - **验证结果**：重新运行 `python3 TestSpace/preprocess_test_v3/test_checkboxes.py --pdf 001 --json` 后，Phase 1 确实把原先分开的两块进一步合并成了一条更长的 merged_line，但结果仍不正确，当前输出变为 `c. quality. Lessor has not received any written complaints or otherwise become aware of any problems with respect to that water`，顺序错误，且末尾 `quality.` 仍未落在正确句尾。因此该 bug 仅部分缓解，尚未完全修复。
 
+### 实例 bug1-2（已修复）
+- **PDF**：018 (9141C.pdf)，第 1 页
+- **字段**：
+  - `7. City *` 与 `8. State *`
+  - `5. City *` 与 `6. State *`
+- **Bug 时效果**：Phase 1 输出把它们错误合并成单条 merged_line：`7. City * 8. State *`、`5. City * 6. State *`
+- **根因**：`_merge_left_right()` 只看“短左片段 + 同行右侧最近 label”，未检查两者之间是否存在竖向分隔线，因此跨列误拼。
+- **修复**：为 `_merge_left_right()` 增加竖向分隔检查。若两条同行文字之间存在：
+  - `vertical_lines`
+  - 竖向深色填充边界
+  则拒绝左右融合。
+- **验证结果**：重新运行 `PYTHONPATH=backend ./venv/bin/python TestSpace/preprocess_test_v3/test_text_fields.py --pdf 018 --json` 后，page 1 已恢复为独立字段：`7. City *`、`8. State *`、`5. City *`、`6. State *`。
+
+### 实例 bug1-3（已修复）
+- **PDF**：018 (9141C.pdf)，第 1 页
+- **字段**：`13. Extension §` 与 `14. Business Email Address *`
+- **Bug 时效果**：即使不经过左右融合，这两段在原始 PDF 文本层里就已经是一条 line，Phase 1 原样输出为 `13. Extension § 14. Business Email Address *`
+- **根因**：PyMuPDF 原始 `line` 跨过了中间列分隔；当前 Phase 1 只有“合并”逻辑，没有“按分隔线拆原始 line”的逻辑。
+- **修复**：在 Phase 1 中新增“按竖向分隔线拆 raw line”的前置步骤。若单条 line 跨过竖向分隔线，且分隔线左右两侧都像独立字段前缀（如 `13.` / `14.`），则先拆成两条，再进入后续 merge。
+- **验证结果**：重新运行 `PYTHONPATH=backend ./venv/bin/python TestSpace/preprocess_test_v3/test_text_fields.py --pdf 018 --json` 后，page 1 已恢复为独立字段：`13. Extension §`、`14. Business Email Address *`。
+
 **期望效果**：merged_lines 中 "1." 和后续文字合并为 "1. Employer's Name and Address"。
 **当前 bug 效果**：merged_lines 中出现 text="1."（单独一条）和 text="Employer's Name and Address"（另一条）。
 
@@ -194,3 +215,35 @@
 
 2. 评估是否要把 ODL raw dir 配置前移到统一测试入口
 - 当前 `text_fields` 侧对 checkbox 的 ODL 增强依赖环境变量；如果测试时不带该变量，会看到 baseline 行为。
+
+## 附录：当前必须考虑的分隔情况（2026-04-05）
+
+当前 preprocess 在做 `merge`、`split`、`fill_rect` 选边界时，至少应把下面这些情况视为“硬分隔”或“优先级很高的分隔信号”：
+
+1. `horizontal_lines`
+- 用于阻止跨行 continuation merge
+- 也用于约束向下扩展的 rect
+
+2. `vertical_lines`
+- 用于阻止同行 label 跨列左右融合
+- 也用于限制向右扩展的 rect
+
+3. 表格边框 / 单元格列边界
+- 本质上通常来自 `horizontal_lines + vertical_lines`
+- 不能跨单元格合并 label，也不能让 rect 穿过列边界
+
+4. 横向深色填充边界
+- 例如黑色/深灰色横条、表头色块底边
+- 既可能是 continuation merge 的隐式边界，也可能是 rect 的底边约束
+
+5. 竖向深色填充边界
+- 例如黑色细竖条、视觉上的列分隔阴影边
+- 不能跨越去做左右 merge，也不能让 rect 超过它
+
+6. 相邻 label 的几何位置
+- 同行右侧下一个 label 的 `x0` 是当前 rect 的天然右边界
+- 同列下一个 label 的 `y0` 是当前 rect 的天然下边界
+
+7. 不同背景色区域
+- 如果两行处于不同填充底色区域，默认应拒绝 continuation merge
+- 这已经在 Phase 1.5 中作为跨色块保护生效

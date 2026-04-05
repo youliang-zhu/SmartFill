@@ -118,6 +118,20 @@ def _in_checkbox_zone(bbox: Tuple[float, ...], zones: List[Obstacle]) -> bool:
     return False
 
 
+def _in_shaded_bar(bbox: Tuple[float, ...], shaded_bars: List[Obstacle]) -> bool:
+    """label 是否处于深色标题条中。"""
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy_ = (bbox[1] + bbox[3]) / 2.0
+    for bx0, by0, bx1, by1 in shaded_bars:
+        if bx0 - 2 <= cx <= bx1 + 2 and by0 - 2 <= cy_ <= by1 + 2:
+            return True
+        overlap_x = _bbox_overlap_x(bbox, (bx0, by0, bx1, by1))
+        overlap_y = _bbox_overlap_y(bbox, (bx0, by0, bx1, by1))
+        if overlap_x > 4.0 and overlap_y > 2.0:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 障碍物 & 边界搜索
 # ---------------------------------------------------------------------------
@@ -375,6 +389,8 @@ def collect_text_fields(
         if _is_noise(text):
             continue
         if _in_checkbox_zone(bbox, cb_zones):
+            continue
+        if _in_shaded_bar(bbox, shaded_bars):
             continue
         labels.append((idx, text, bbox))
 

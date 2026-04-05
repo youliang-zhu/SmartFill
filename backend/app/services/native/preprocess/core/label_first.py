@@ -19,6 +19,7 @@ class LabelFirstMixin:
         text_spans = self.extract_text_spans(page, page_num)
         text_lines = self._extract_text_lines(page, page_num)
         drawing_data = self.extract_drawings(page, page_num)
+        text_lines = self._split_lines_by_vertical_separators(text_lines, drawing_data=drawing_data)
         tables = self._build_table_grids(drawing_data, page_num)
         page_rect = self._rect_tuple(page.rect)
 
@@ -26,7 +27,7 @@ class LabelFirstMixin:
         merged_lines, _ = self._merge_continuation_lines(text_lines, drawing_data=drawing_data)
 
         # Phase 1.6：左右融合（短文本以字母/数字开头且 ≤ 10 字符 → 与右侧合并）
-        merged_lines = self._merge_left_right(merged_lines)
+        merged_lines = self._merge_left_right(merged_lines, drawing_data=drawing_data)
 
         # Phase 1 输出打包
         phase1_data = {

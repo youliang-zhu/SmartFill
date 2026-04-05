@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List
 
 import fitz
@@ -9,6 +10,9 @@ from app.services.native.preprocess.core.types import RectTuple
 
 class ExtractionMixin:
     """PDF 文字/矢量提取与表格网格构建。"""
+
+    _FIELD_PREFIX_RE = re.compile(r"^(?:\(?[A-Za-z0-9]{1,3}[.)]|[0-9]{1,2}[A-Za-z]?\.)\s*\S")
+
     def extract_text_spans(self, page: fitz.Page, page_num: int) -> List[Dict[str, Any]]:
         spans: List[Dict[str, Any]] = []
         text_dict = page.get_text("dict")
@@ -47,6 +51,7 @@ class ExtractionMixin:
                 font_sizes: list[float] = []
                 char_y_tops: list[float] = []
                 char_y_bottoms: list[float] = []
+                spans_meta: list[Dict[str, Any]] = []
                 for span in line_spans:
                     t = self._normalize_text(span.get("text", ""))
                     if not t:
@@ -54,6 +59,7 @@ class ExtractionMixin:
                     texts.append(t)
                     sb = self._rect_tuple(fitz.Rect(span.get("bbox")))
                     bbox = sb if bbox is None else self._bbox_union(bbox, sb)
+                    spans_meta.append({"text": t, "bbox": sb})
                     font_sizes.append(float(span.get("size", 0.0)))
                     char_y_tops.append(float(sb[1]))
                     origin = span.get("origin")
@@ -72,9 +78,148 @@ class ExtractionMixin:
                         "page_num": page_num,
                         "char_y_top": min(char_y_tops),
                         "char_y_bottom": max(char_y_bottoms),
+                        "spans_meta": spans_meta,
                     }
                 )
         return lines_out
+
+    def _extract_dark_vertical_edges(self, drawings: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+        edges: List[Dict[str, float]] = []
+        for drawing in drawings:
+            fill = drawing.get("fill")
+            rect = drawing.get("rect")
+            if fill is None or rect is None:
+                continue
+            if not (isinstance(fill, (list, tuple)) and len(fill) >= 3):
+                continue
+            r, g, b = float(fill[0]), float(fill[1]), float(fill[2])
+            if r + g + b > 1.5:
+                continue
+            x0, y0, x1, y1 = map(float, rect)
+            width = x1 - x0
+            height = y1 - y0
+            if width > max(4.0, self.LINE_THICKNESS_MAX * 4.0):
+                continue
+            if height < self.MIN_LINE_LEN:
+                continue
+            edges.append({"x": (x0 + x1) / 2.0, "y0": y0, "y1": y1})
+        return self._merge_vertical_lines(edges)
+
+    def _iter_vertical_separators(self, drawing_data: Dict[str, Any] | None = None) -> List[Dict[str, float]]:
+        drawing_data = drawing_data or {}
+        base = [dict(v) for v in drawing_data.get("vertical_lines", [])]
+        dark = self._extract_dark_vertical_edges(drawing_data.get("drawings", []))
+        return self._merge_vertical_lines(base + dark)
+
+    def _looks_like_field_prefix(self, text: str) -> bool:
+        return bool(self._FIELD_PREFIX_RE.match(text.strip()))
+
+    def _has_vertical_separator_between(
+        self,
+        left_bbox: RectTuple,
+        right_bbox: RectTuple,
+        drawing_data: Dict[str, Any] | None = None,
+    ) -> bool:
+        if drawing_data is None:
+            return False
+        gap_left = float(left_bbox[2])
+        gap_right = float(right_bbox[0])
+        if gap_right <= gap_left:
+            return False
+        band_y0 = max(float(left_bbox[1]), float(right_bbox[1])) - 1.0
+        band_y1 = min(float(left_bbox[3]), float(right_bbox[3])) + 1.0
+        if band_y1 <= band_y0:
+            return False
+        for sep in self._iter_vertical_separators(drawing_data):
+            sx = float(sep["x"])
+            if not (gap_left <= sx <= gap_right):
+                continue
+            if float(sep["y0"]) <= band_y1 and float(sep["y1"]) >= band_y0:
+                return True
+        return False
+
+    def _build_line_from_spans(self, base_line: Dict[str, Any], spans: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+        if not spans:
+            return None
+        texts = [sp["text"] for sp in spans if sp.get("text")]
+        if not texts:
+            return None
+        bbox = spans[0]["bbox"]
+        for sp in spans[1:]:
+            bbox = self._bbox_union(bbox, sp["bbox"])
+        return {
+            "text": self._normalize_text(" ".join(texts)),
+            "bbox": bbox,
+            "font_size": float(base_line.get("font_size", 0.0)),
+            "page_num": base_line.get("page_num", 0),
+            "char_y_top": float(base_line.get("char_y_top", bbox[1])),
+            "char_y_bottom": float(base_line.get("char_y_bottom", bbox[3])),
+            "spans_meta": spans,
+        }
+
+    def _split_lines_by_vertical_separators(
+        self,
+        text_lines: List[Dict[str, Any]],
+        drawing_data: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
+        if not text_lines:
+            return []
+        separators = self._iter_vertical_separators(drawing_data)
+        if not separators:
+            return text_lines
+
+        split_lines: List[Dict[str, Any]] = []
+        for line in text_lines:
+            spans = [sp for sp in line.get("spans_meta", []) if sp.get("text")]
+            if len(spans) < 2:
+                split_lines.append(line)
+                continue
+            candidates = [
+                sep for sep in separators
+                if float(line["bbox"][0]) + 1.0 < float(sep["x"]) < float(line["bbox"][2]) - 1.0
+                and float(sep["y0"]) <= float(line["bbox"][3]) + 1.0
+                and float(sep["y1"]) >= float(line["bbox"][1]) - 1.0
+            ]
+            if not candidates:
+                split_lines.append(line)
+                continue
+
+            segments = [line]
+            for sep in sorted(candidates, key=lambda item: float(item["x"])):
+                next_segments: List[Dict[str, Any]] = []
+                sx = float(sep["x"])
+                for segment in segments:
+                    seg_spans = [sp for sp in segment.get("spans_meta", []) if sp.get("text")]
+                    if len(seg_spans) < 2:
+                        next_segments.append(segment)
+                        continue
+                    if not (float(segment["bbox"][0]) + 1.0 < sx < float(segment["bbox"][2]) - 1.0):
+                        next_segments.append(segment)
+                        continue
+                    left_spans = []
+                    right_spans = []
+                    for sp in seg_spans:
+                        sb = sp["bbox"]
+                        scx = (float(sb[0]) + float(sb[2])) / 2.0
+                        if scx < sx:
+                            left_spans.append(sp)
+                        elif scx > sx:
+                            right_spans.append(sp)
+                    left_line = self._build_line_from_spans(segment, left_spans)
+                    right_line = self._build_line_from_spans(segment, right_spans)
+                    if (
+                        left_line is None
+                        or right_line is None
+                        or not self._looks_like_field_prefix(left_line["text"])
+                        or not self._looks_like_field_prefix(right_line["text"])
+                    ):
+                        next_segments.append(segment)
+                        continue
+                    next_segments.extend([left_line, right_line])
+                segments = next_segments
+            split_lines.extend(segments)
+
+        return split_lines
 
     def _merge_continuation_lines(
         self,
@@ -271,6 +416,7 @@ class ExtractionMixin:
     def _merge_left_right(
         self,
         merged_lines: List[Dict[str, Any]],
+        drawing_data: Dict[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         """Phase 1.6：左右融合。
 
@@ -311,6 +457,8 @@ class ExtractionMixin:
                     # y 重叠 > 0
                     y_overlap = min(float(bi[3]), float(bj[3])) - max(float(bi[1]), float(bj[1]))
                     if y_overlap <= 0:
+                        continue
+                    if self._has_vertical_separator_between(bi, bj, drawing_data=drawing_data):
                         continue
                     gap = float(bj[0]) - float(bi[0])
                     if gap < best_gap:
