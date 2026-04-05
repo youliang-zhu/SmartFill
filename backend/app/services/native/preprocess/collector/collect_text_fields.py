@@ -351,22 +351,22 @@ def _build_below_rect(
     obstacles: List[Obstacle],
 ) -> Optional[List[float]]:
     """直接按障碍物生成下方候选，不再先铺大框后 shrink。"""
-    if right_limit - lx0 <= _TOL or bottom_limit - ly1 <= _TOL:
+    if right_limit <= lx0 or bottom_limit <= ly1:
         return None
 
     probe_right = min(right_limit, lx0 + 1.0)
-    if probe_right - lx0 <= _TOL:
-        return None
 
     bottom = _find_bottom_bound(ly1, lx0, probe_right, obstacles) or bottom_limit
     bottom = min(bottom, bottom_limit)
-    if bottom - ly1 <= _TOL:
+    if bottom <= ly1:
         return None
 
     right = _find_right_bound(lx0, ly1, bottom, obstacles) or right_limit
     right = min(right, right_limit)
-    rect = _normalize_rect([lx0, ly1, right, bottom])
-    if rect is None or _rect_overlaps_any(rect, obstacles):
+    rect = [lx0, ly1, right, bottom]
+    if right <= lx0 or bottom <= ly1:
+        return None
+    if _rect_overlaps_any(rect, obstacles):
         return None
     return rect
 
