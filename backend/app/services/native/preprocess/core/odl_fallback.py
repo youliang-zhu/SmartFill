@@ -24,10 +24,6 @@ from app.services.native.preprocess.core.types import RectTuple
 _ODL_TEXT_TYPES = {"paragraph", "heading", "caption", "list item", "text block"}
 _ODL_OPTION_TEXTS = {"yes", "no", "true", "false", "si", "sí"}
 _ODL_FALLBACK_RAW_DIR_ENV = "SMARTFILL_ODL_FALLBACK_RAW_DIR"
-_REPO_ROOT = Path(__file__).resolve().parents[6]
-_DEFAULT_ODL_RUNS_ROOT = (
-    _REPO_ROOT / "Testspace-opensourced-tools" / "opendataloader" / "runs" / "opendataloader"
-)
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _IF_PREFIX_RE = re.compile(r"^\s*[\(\[]?\s*if\s+(?:yes|no|true|false)\b", re.I)
 _TRAILING_OPTION_PAIR_RE = re.compile(
@@ -101,31 +97,8 @@ def _load_odl_fallback_lines_cached(
     return tuple(rows)
 
 
-@lru_cache(maxsize=1)
-def _discover_default_odl_fallback_raw_dir() -> str:
-    if not _DEFAULT_ODL_RUNS_ROOT.exists():
-        return ""
-    run_dirs = sorted(
-        (path for path in _DEFAULT_ODL_RUNS_ROOT.iterdir() if path.is_dir()),
-        key=lambda path: path.name,
-        reverse=True,
-    )
-    for run_dir in run_dirs:
-        raw_dirs = sorted(
-            (path for path in run_dir.glob("mode_*/stage_01_convert/raw") if path.is_dir()),
-            key=lambda path: str(path),
-            reverse=True,
-        )
-        if raw_dirs:
-            return str(raw_dirs[0])
-    return ""
-
-
 def _resolve_odl_fallback_raw_dir() -> str:
-    explicit = os.environ.get(_ODL_FALLBACK_RAW_DIR_ENV, "").strip()
-    if explicit and Path(explicit).exists():
-        return explicit
-    return _discover_default_odl_fallback_raw_dir()
+    return os.environ.get(_ODL_FALLBACK_RAW_DIR_ENV, "").strip()
 
 
 def _load_odl_fallback_lines(
