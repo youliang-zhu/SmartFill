@@ -345,6 +345,13 @@
 - 当前统一入口环境变量为 `SMARTFILL_ODL_FALLBACK_RAW_DIR`。
 - 这样做的原因是：ODL 在本项目中属于“文本补全信号”，不是“几何真值信号”。
 
+4. `ODL_FALLBACK` 主代码内生化与可视化一致性（2026-04-07）
+- 当前目标不再接受“是否带环境变量”决定 ODL completion 是否参与。
+- 正确语义应为：
+  - 如果项目内存在对应 PDF 的 ODL raw JSON，则 fallback 自然参与
+  - 如果不存在，则自然 no-op
+- 同时，`merge_after` / Phase 2 可视化结果应统一展示主链最终 completed lines，而不是仅展示 Phase 1.6 的 native merge 中间态。
+
 ## 附录：当前必须考虑的分隔情况（2026-04-05）
 
 当前 preprocess 在做 `merge`、`split`、`fill_rect` 选边界时，至少应把下面这些情况视为“硬分隔”或“优先级很高的分隔信号”：

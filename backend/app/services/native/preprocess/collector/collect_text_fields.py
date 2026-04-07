@@ -21,10 +21,6 @@ from app.services.native.preprocess.collector.collect_checkboxes import (
     _extract_shaded_bars,
     _in_table_zone,
 )
-from app.services.native.preprocess.core.odl_fallback import (
-    _find_odl_label_completion,
-    _load_odl_fallback_lines,
-)
 
 # ---------------------------------------------------------------------------
 # 类型 & 常量
@@ -487,12 +483,6 @@ def collect_text_fields(
     dark_vertical_edges = _extract_dark_vertical_edges(raw_drawings)
     dark_horizontal_edges = _extract_dark_horizontal_edges(raw_drawings)
     cb_zones = _build_checkbox_zones(checkbox_fields)
-    odl_lines = _load_odl_fallback_lines(
-        pdf_path=pdf_path,
-        page_num=int(phase1_data.get("page_num", 0)),
-        page_size=page_size,
-    )
-
     # ==================================================================
     # 收集 label 候选（噪声 + table + checkbox 禁区 + 已消耗 全部过滤）
     # ==================================================================
@@ -686,50 +676,6 @@ def collect_text_fields(
                 "fill_rect": fr,
             })
             new_consumed.add(f"line:{idx}")
-
-    if odl_lines:
-        for field in fields:
-            label = str(field.get("label", "")).strip()
-            label_bbox = field.get("label_bbox")
-            if not label or label_bbox is None:
-                continue
-            odl_label, odl_bbox = _find_odl_label_completion(
-                baseline_label=label,
-                baseline_bbox=label_bbox,
-                odl_lines=odl_lines,
-                allow_shorter=False,
-                allow_if_prefix=True,
-            )
-            if odl_label and odl_bbox is not None:
-                field["label"] = odl_label
-                field["label_bbox"] = list(odl_bbox)
-
-        deduped_fields: List[Dict[str, Any]] = []
-        dedup_index: Dict[Tuple[str, Tuple[float, float, float, float]], int] = {}
-        for field in fields:
-            label = re.sub(r"\s+", " ", str(field.get("label", "")).strip())
-            label_bbox = field.get("label_bbox")
-            if not label or not label_bbox:
-                deduped_fields.append(field)
-                continue
-
-            label_core = re.sub(r"^\s*(?:\d+\.\s*|[A-Za-z]\.\s*)", "", label)
-            bbox_key = tuple(round(float(v), 2) for v in label_bbox)
-            key = (label_core, bbox_key)
-            if key not in dedup_index:
-                dedup_index[key] = len(deduped_fields)
-                deduped_fields.append(field)
-                continue
-
-            prev = deduped_fields[dedup_index[key]]
-            prev_rect = prev.get("fill_rect")
-            curr_rect = field.get("fill_rect")
-            if len(label) > len(str(prev.get("label", ""))):
-                prev["label"] = label
-            if _rect_area(curr_rect) > _rect_area(prev_rect):
-                prev["fill_rect"] = curr_rect
-
-        fields = deduped_fields
 
     # ==================================================================
     # Separator-Aware Allowed Region Refinement

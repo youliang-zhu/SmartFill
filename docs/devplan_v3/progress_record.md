@@ -369,3 +369,31 @@ Phase 2B 仍有两个 PDF 存在残留的重叠问题。001 号 PDF（FDIC f3700
 残留：
 
 - `004 p9` 免责声明密集区仍有 2 处 text `fill_rect -> other label_bbox` 重叠，后续还需要单独处理
+
+## 九、ODL_FALLBACK 内生化与可视化对齐（2026-04-07）
+
+本轮收敛了两个容易误导判断的点：
+
+- `ODL_FALLBACK` 不再把环境变量当成“是否启用”的开关
+- `preprocess_test_v3` 的 `merge_after` / Phase 2 入口统一展示主链最终 completed lines，而不是 Phase 1.6 中间态
+
+代码侧：
+
+- [odl_fallback.py](/home/agent/SmartFill/backend/app/services/native/preprocess/core/odl_fallback.py)
+  - `_resolve_odl_fallback_raw_dir()` 改为：
+    - 若显式环境变量存在且路径有效，则使用该路径
+    - 否则自动发现 repo 内 `Testspace-opensourced-tools/opendataloader/runs/opendataloader/*/mode_*/stage_01_convert/raw`
+
+- [common.py](/home/agent/SmartFill/TestSpace/preprocess_test_v3/common.py)
+  - `collect_phase1_with_merge()` 现在在 Phase 1.6 后继续执行 Phase 1.7 completion
+  - 返回：
+    - `native_merged_lines`
+    - `completed_lines`
+    - `merged_lines`：为兼容现有调用，统一指向最终 completed lines
+
+- [test_phase1.py](/home/agent/SmartFill/TestSpace/preprocess_test_v3/test_phase1.py)
+- [test_text_fields.py](/home/agent/SmartFill/TestSpace/preprocess_test_v3/test_text_fields.py)
+- [test_checkboxes.py](/home/agent/SmartFill/TestSpace/preprocess_test_v3/test_checkboxes.py)
+- [test_phases_v3.py](/home/agent/SmartFill/TestSpace/preprocess_test_v3/test_phases_v3.py)
+  - 统一通过 `collect_phase1_with_merge(..., pdf_path)` 消费最终 completed lines
+  - `merge_after` 可视化展示主链最终结果，不再停在 native merge 中间态

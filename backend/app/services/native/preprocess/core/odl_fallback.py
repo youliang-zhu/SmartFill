@@ -24,6 +24,10 @@ from app.services.native.preprocess.core.types import RectTuple
 _ODL_TEXT_TYPES = {"paragraph", "heading", "caption", "list item", "text block"}
 _ODL_OPTION_TEXTS = {"yes", "no", "true", "false", "si", "sí"}
 _ODL_FALLBACK_RAW_DIR_ENV = "SMARTFILL_ODL_FALLBACK_RAW_DIR"
+_REPO_ROOT = Path(__file__).resolve().parents[6]
+_DEFAULT_ODL_RUNS_ROOT = (
+    _REPO_ROOT / "Testspace-opensourced-tools" / "opendataloader" / "runs" / "opendataloader"
+)
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _IF_PREFIX_RE = re.compile(r"^\s*[\(\[]?\s*if\s+(?:yes|no|true|false)\b", re.I)
 _TRAILING_OPTION_PAIR_RE = re.compile(
@@ -97,8 +101,31 @@ def _load_odl_fallback_lines_cached(
     return tuple(rows)
 
 
+@lru_cache(maxsize=1)
+def _discover_default_odl_fallback_raw_dir() -> str:
+    if not _DEFAULT_ODL_RUNS_ROOT.exists():
+        return ""
+    run_dirs = sorted(
+        (path for path in _DEFAULT_ODL_RUNS_ROOT.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for run_dir in run_dirs:
+        raw_dirs = sorted(
+            (path for path in run_dir.glob("mode_*/stage_01_convert/raw") if path.is_dir()),
+            key=lambda path: str(path),
+            reverse=True,
+        )
+        if raw_dirs:
+            return str(raw_dirs[0])
+    return ""
+
+
 def _resolve_odl_fallback_raw_dir() -> str:
-    return os.environ.get(_ODL_FALLBACK_RAW_DIR_ENV, "").strip()
+    explicit = os.environ.get(_ODL_FALLBACK_RAW_DIR_ENV, "").strip()
+    if explicit and Path(explicit).exists():
+        return explicit
+    return _discover_default_odl_fallback_raw_dir()
 
 
 def _load_odl_fallback_lines(
@@ -233,3 +260,94 @@ def _find_odl_label_completion(
         prefixed = f"{prefix} {prefixed}"
     return prefixed, best[2]
 
+
+def _apply_odl_label_completion_to_lines(
+    text_lines: List[Dict[str, Any]],
+    pdf_path: str,
+    page_num: int,
+    page_size: RectTuple | None,
+    allow_if_prefix: bool = True,
+) -> List[Dict[str, Any]]:
+    """Preprocess-level Phase 1.7: complete split native lines using ODL text blocks.
+
+    This stage is intentionally limited to text completion:
+    - native geometry extraction and merge stay unchanged
+    - ODL only upgrades line text/bbox when a high-confidence completion exists
+    - duplicate completed lines are collapsed before collectors run
+    """
+    odl_lines = _load_odl_fallback_lines(
+        pdf_path=pdf_path,
+        page_num=page_num,
+        page_size=page_size,
+    )
+    if not odl_lines:
+        return text_lines
+
+    completed: List[Dict[str, Any]] = []
+    for line in text_lines:
+        text = _normalize_text(str(line.get("text", "")))
+        bbox = line.get("bbox")
+        if not text or bbox is None:
+            completed.append(line)
+            continue
+        try:
+            base_bbox = tuple(float(v) for v in bbox)
+        except Exception:
+            completed.append(line)
+            continue
+        if len(base_bbox) != 4:
+            completed.append(line)
+            continue
+
+        odl_label, odl_bbox = _find_odl_label_completion(
+            baseline_label=text,
+            baseline_bbox=base_bbox,
+            odl_lines=odl_lines,
+            allow_shorter=False,
+            allow_if_prefix=allow_if_prefix,
+        )
+        if not odl_label or odl_bbox is None:
+            completed.append(line)
+            continue
+
+        patched = dict(line)
+        patched["text"] = odl_label
+        patched["bbox"] = list(odl_bbox)
+        completed.append(patched)
+
+    deduped: List[Dict[str, Any]] = []
+    dedup_index: Dict[Tuple[str, Tuple[float, float, float, float]], int] = {}
+    for line in completed:
+        text = _normalize_text(str(line.get("text", "")))
+        bbox = line.get("bbox")
+        if not text or bbox is None:
+            deduped.append(line)
+            continue
+        try:
+            bbox_key = tuple(round(float(v), 2) for v in bbox)
+        except Exception:
+            deduped.append(line)
+            continue
+        if len(bbox_key) != 4:
+            deduped.append(line)
+            continue
+
+        text_core = _strip_enum_prefix(_strip_trailing_option_tail(text))
+        key = (text_core, bbox_key)
+        if key not in dedup_index:
+            dedup_index[key] = len(deduped)
+            deduped.append(line)
+            continue
+
+        prev = deduped[dedup_index[key]]
+        prev_text = _normalize_text(str(prev.get("text", "")))
+        if len(text) > len(prev_text):
+            deduped[dedup_index[key]] = line
+
+    deduped.sort(
+        key=lambda line: (
+            float(line.get("bbox", [0.0, 0.0, 0.0, 0.0])[1]),
+            float(line.get("bbox", [0.0, 0.0, 0.0, 0.0])[0]),
+        )
+    )
+    return deduped

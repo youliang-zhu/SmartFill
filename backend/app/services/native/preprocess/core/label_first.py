@@ -9,6 +9,7 @@ import fitz
 
 from app.services.native.preprocess.collector.collect_checkboxes import collect_checkboxes
 from app.services.native.preprocess.collector.collect_text_fields import collect_text_fields
+from app.services.native.preprocess.core.odl_fallback import _apply_odl_label_completion_to_lines
 
 
 class LabelFirstMixin:
@@ -29,13 +30,22 @@ class LabelFirstMixin:
         # Phase 1.6：左右融合（短文本以字母/数字开头且 ≤ 10 字符 → 与右侧合并）
         merged_lines = self._merge_left_right(merged_lines, drawing_data=drawing_data)
 
+        # Phase 1.7：ODL fallback 仅做文本补全，不改 native 几何检测主链
+        completed_lines = _apply_odl_label_completion_to_lines(
+            text_lines=merged_lines,
+            pdf_path=pdf_path,
+            page_num=page_num,
+            page_size=page_rect,
+            allow_if_prefix=True,
+        )
+
         # Phase 1 输出打包
         phase1_data = {
             "page_num": page_num,
             "pdf_path": pdf_path,
             "page_size": page_rect,
             "text_spans": text_spans,
-            "text_lines": merged_lines,
+            "text_lines": completed_lines,
             "drawing_data": drawing_data,
             "table_structures": tables,
         }
@@ -55,7 +65,7 @@ class LabelFirstMixin:
             "page_num": page_num,
             "page_size": page_rect,
             "text_spans": text_spans,
-            "text_lines": merged_lines,
+            "text_lines": completed_lines,
             "table_structures": tables,
             "detected_fields": detected_fields,
         }
