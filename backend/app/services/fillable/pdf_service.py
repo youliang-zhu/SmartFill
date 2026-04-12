@@ -128,6 +128,7 @@ class PDFService:
             for page_num in range(len(writer.pages)):
                 page = writer.pages[page_num]
                 annots = page.get("/Annots")
+                annots = annots.get_object() if hasattr(annots, "get_object") else annots
                 if not annots:
                     logger.info(f"[PDF 填写] 第 {page_num + 1} 页: 无 annotations，跳过")
                     continue
